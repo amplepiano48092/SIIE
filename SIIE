@@ -1,0 +1,1104 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+from PIL import Image, ImageTk
+import pandas as pd
+import os
+import json
+from datetime import datetime
+import sys
+
+# Janela Principal
+app = tk.Tk()
+app.title('SIIE - Sistema Interno de Informações de Estagio')
+app.geometry('500x700')
+app.resizable(False, False)
+
+# Caminhos dos arquivos de dados
+USERS_FILE = "usuarios.json"
+DATA_FILE = "dados.xlsx"
+CARTOES_FILE = "cartoes.json"
+
+# ========== FUNÇÕES DE CARREGAMENTO ==========
+
+def carregar_usuarios():
+    """Carrega usuários do arquivo JSON"""
+    if os.path.exists(USERS_FILE):
+        try:
+            with open(USERS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Erro ao carregar usuários: {e}")
+            return {}
+    return {}
+
+def salvar_usuarios(dados):
+    """Salva usuários no arquivo JSON"""
+    try:
+        with open(USERS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(dados, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        print(f"Erro ao salvar usuários: {e}")
+
+def carregar_cartoes():
+    """Carrega cartões do arquivo JSON"""
+    if os.path.exists(CARTOES_FILE):
+        try:
+            with open(CARTOES_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Erro ao carregar cartões: {e}")
+    
+    # Estrutura padrão
+    return {
+        "ED 5A 5B 2F": {"dono": "", "ativo": True},
+        "97 66 EC D8": {"dono": "", "ativo": True},
+        "A7 D6 DE D7": {"dono": "", "ativo": True},
+        "57 B4 EF D8": {"dono": "", "ativo": True}
+    }
+
+def salvar_cartoes(dados):
+    """Salva cartões no arquivo JSON"""
+    try:
+        with open(CARTOES_FILE, 'w', encoding='utf-8') as f:
+            json.dump(dados, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        print(f"Erro ao salvar cartões: {e}")
+
+def carregar_dados_xlsx():
+    """Carrega dados do arquivo Excel"""
+    if os.path.exists(DATA_FILE):
+        try:
+            return pd.read_excel(DATA_FILE)
+        except Exception as e:
+            print(f"Erro ao carregar dados Excel: {e}")
+    
+    return pd.DataFrame(columns=['Usuario', 'Data', 'Entrada', 'Saida', 'Horas', 'Cartao'])
+
+def salvar_dados_xlsx(df):
+    """Salva dados no arquivo Excel"""
+    try:
+        df.to_excel(DATA_FILE, index=False)
+    except Exception as e:
+        print(f"Erro ao salvar dados Excel: {e}")
+
+# ========== FUNÇÃO PARA CALCULAR HORAS DE UM USUÁRIO ==========
+
+def calcular_horas_usuario(usuario_nome):
+    """Calcula o total de horas de um usuário específico"""
+    df = carregar_dados_xlsx()
+    
+    if df.empty:
+        return 0.0, []
+    
+    # Filtrar registros do usuário
+    registros_usuario = df[df['Usuario'] == usuario_nome]
+    
+    if registros_usuario.empty:
+        return 0.0, []
+    
+    # Converter horas para timedelta e calcular total
+    total_horas = 0.0
+    registros_detalhados = []
+    
+    for idx, row in registros_usuario.iterrows():
+        try:
+            horas_str = str(row['Horas'])
+            if horas_str and horas_str != 'nan' and horas_str != 'NaT':
+                # Converter string para timedelta
+                if 'day' in horas_str:
+                    # Formato com dias
+                    partes = horas_str.split()
+                    dias = int(partes[0])
+                    tempo = partes[2]
+                    horas, minutos, segundos = map(int, tempo.split(':'))
+                    total_segundos = dias * 86400 + horas * 3600 + minutos * 60 + segundos
+                else:
+                    # Formato HH:MM:SS
+                    try:
+                        horas, minutos, segundos = map(int, horas_str.split(':'))
+                        total_segundos = horas * 3600 + minutos * 60 + segundos
+                    except:
+                        # Tentar outro formato
+                        try:
+                            from datetime import timedelta
+                            td = pd.Timedelta(horas_str)
+                            total_segundos = td.total_seconds()
+                        except:
+                            continue
+                
+                horas_totais = total_segundos / 3600
+                total_horas += horas_totais
+                
+                # Formatar para exibição
+                horas_int = int(horas_totais)
+                minutos_int = int((horas_totais - horas_int) * 60)
+                
+                registros_detalhados.append({
+                    'data': row['Data'],
+                    'entrada': row['Entrada'],
+                    'saida': row['Saida'],
+                    'horas': f"{horas_int}h{minutos_int:02d}min"
+                })
+        except Exception as e:
+            print(f"Erro ao processar linha {idx}: {e}")
+            continue
+    
+    return total_horas, registros_detalhados
+
+# ========== FUNÇÕES PRINCIPAIS COM INTERFACES ORGANIZADAS ==========
+
+def dadoss():
+    app.withdraw()
+    dados = tk.Toplevel()
+    dados.title('SIIE - Dados e Relatórios')
+    dados.geometry('1000x700')
+    dados.resizable(True, True)
+    
+    # Frame principal
+    main_frame = tk.Frame(dados)
+    main_frame.pack(fill='both', expand=True, padx=20, pady=20)
+    
+    # Título
+    titulo_frame = tk.Frame(main_frame)
+    titulo_frame.pack(fill='x', pady=(0, 20))
+    
+    tk.Label(titulo_frame, text='DADOS E RELATÓRIOS', 
+             font=('Times New Roman', 18, 'bold')).pack()
+    tk.Label(titulo_frame, text='Selecione um usuário para ver suas horas detalhadas',
+             font=('Times New Roman', 10)).pack()
+    
+    # Frame para duas colunas
+    colunas_frame = tk.Frame(main_frame)
+    colunas_frame.pack(fill='both', expand=True)
+    
+    # Coluna da esquerda - Lista de usuários
+    coluna_esquerda = tk.Frame(colunas_frame, width=300, bg='#f5f5f5')
+    coluna_esquerda.pack(side='left', fill='both', padx=(0, 10))
+    coluna_esquerda.pack_propagate(False)
+    
+    tk.Label(coluna_esquerda, text='LISTA DE USUÁRIOS', 
+             font=('Times New Roman', 12, 'bold'), bg='#f5f5f5', pady=10).pack()
+    
+    # Frame para lista com scrollbar
+    lista_frame = tk.Frame(coluna_esquerda)
+    lista_frame.pack(fill='both', expand=True, padx=10, pady=10)
+    
+    # Listbox para usuários
+    lista_usuarios = tk.Listbox(lista_frame, font=('Times New Roman', 11), 
+                               selectmode='single', height=15)
+    scrollbar = tk.Scrollbar(lista_frame)
+    lista_usuarios.configure(yscrollcommand=scrollbar.set)
+    scrollbar.config(command=lista_usuarios.yview)
+    
+    lista_usuarios.pack(side='left', fill='both', expand=True)
+    scrollbar.pack(side='right', fill='y')
+    
+    # Carregar usuários
+    usuarios_dict = carregar_usuarios()
+    for usuario in usuarios_dict.keys():
+        lista_usuarios.insert(tk.END, usuario)
+    
+    # Frame para botões da coluna esquerda
+    botoes_esquerda = tk.Frame(coluna_esquerda, bg='#f5f5f5', pady=10)
+    botoes_esquerda.pack(fill='x', padx=10)
+    
+    def atualizar_lista_usuarios():
+        lista_usuarios.delete(0, tk.END)
+        usuarios_dict = carregar_usuarios()
+        for usuario in usuarios_dict.keys():
+            lista_usuarios.insert(tk.END, usuario)
+    
+    tk.Button(botoes_esquerda, text="Atualizar Lista", font=('Times New Roman', 9),
+              command=atualizar_lista_usuarios, bg='#2196F3', fg='white',
+              padx=10, pady=5).pack(fill='x')
+    
+    # Coluna da direita - Detalhes do usuário selecionado
+    coluna_direita = tk.Frame(colunas_frame)
+    coluna_direita.pack(side='left', fill='both', expand=True)
+    
+    # Frame para informações do usuário
+    info_frame = tk.Frame(coluna_direita, relief='groove', borderwidth=2,
+                         bg='#f8f9fa', padx=15, pady=15)
+    info_frame.pack(fill='x', pady=(0, 20))
+    
+    # Título da seção de horas
+    titulo_horas = tk.Label(info_frame, text='Selecione um usuário à esquerda', 
+                           font=('Times New Roman', 14, 'bold'), bg='#f8f9fa')
+    titulo_horas.pack()
+    
+    # Label para total de horas
+    total_horas_var = tk.StringVar()
+    total_horas_var.set('')
+    label_total_horas = tk.Label(info_frame, textvariable=total_horas_var,
+                                font=('Times New Roman', 12), bg='#f8f9fa', fg='#2e7d32')
+    label_total_horas.pack(pady=5)
+    
+    # Frame para Treeview dos registros
+    tree_frame = tk.Frame(coluna_direita)
+    tree_frame.pack(fill='both', expand=True)
+    
+    tk.Label(tree_frame, text='REGISTROS DETALHADOS', 
+             font=('Times New Roman', 12, 'bold')).pack(anchor='w', pady=(0, 10))
+    
+    # Treeview para registros
+    tree = ttk.Treeview(tree_frame, columns=('Data', 'Entrada', 'Saida', 'Horas'), 
+                        show='headings', height=10)
+    
+    vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=vsb.set)
+    
+    # Definir cabeçalhos
+    colunas_tree = [('Data', 'Data', 100),
+                   ('Entrada', 'Entrada', 80),
+                   ('Saida', 'Saída', 80),
+                   ('Horas', 'Horas', 100)]
+    
+    for col, texto, largura in colunas_tree:
+        tree.heading(col, text=texto)
+        tree.column(col, width=largura)
+    
+    tree.pack(side='left', fill='both', expand=True)
+    vsb.pack(side='right', fill='y')
+    
+    # Frame para botões de ação
+    botoes_frame = tk.Frame(coluna_direita)
+    botoes_frame.pack(fill='x', pady=20)
+    
+    # Função para exibir detalhes do usuário selecionado
+    def exibir_detalhes_usuario(event=None):
+        # Limpar treeview
+        for item in tree.get_children():
+            tree.delete(item)
+        
+        selecao = lista_usuarios.curselection()
+        if not selecao:
+            titulo_horas.config(text='Selecione um usuário à esquerda')
+            total_horas_var.set('')
+            return
+        
+        usuario_nome = lista_usuarios.get(selecao[0])
+        
+        # Atualizar título
+        titulo_horas.config(text=f'{usuario_nome}')
+        
+        # Calcular horas totais
+        total_horas, registros = calcular_horas_usuario(usuario_nome)
+        
+        # Exibir total de horas
+        if total_horas > 0:
+            horas_int = int(total_horas)
+            minutos_int = int((total_horas - horas_int) * 60)
+            total_texto = f'TOTAL DE HORAS: {horas_int}h{minutos_int:02d}min ({total_horas:.2f} horas)'
+        else:
+            total_texto = 'TOTAL DE HORAS: 0h00min'
+        
+        total_horas_var.set(total_texto)
+        
+        # Exibir registros na treeview
+        if registros:
+            for registro in registros:
+                tree.insert('', 'end', values=(
+                    registro['data'],
+                    registro['entrada'],
+                    registro['saida'],
+                    registro['horas']
+                ))
+        else:
+            tree.insert('', 'end', values=('Nenhum registro encontrado', '', '', ''))
+    
+    # Vincular seleção da lista à função
+    lista_usuarios.bind('<<ListboxSelect>>', exibir_detalhes_usuario)
+    
+    # Botão para recalcular
+    def recarregar_detalhes():
+        exibir_detalhes_usuario()
+    
+    tk.Button(botoes_frame, text="Recarregar Detalhes", font=('Times New Roman', 10),
+              command=recarregar_detalhes, bg='#4CAF50', fg='white',
+              padx=15, pady=8).pack(side='left', padx=5)
+    
+    # Função para exportar relatório do usuário selecionado
+    def exportar_relatorio_usuario():
+        selecao = lista_usuarios.curselection()
+        if not selecao:
+            messagebox.showwarning("Aviso", "Selecione um usuário para exportar!")
+            return
+        
+        usuario_nome = lista_usuarios.get(selecao[0])
+        total_horas, registros = calcular_horas_usuario(usuario_nome)
+        
+        try:
+            with open(f'relatorio_{usuario_nome.replace(" ", "_")}.txt', 'w', encoding='utf-8') as f:
+                f.write(f"RELATÓRIO INDIVIDUAL - {usuario_nome}\n")
+                f.write("=" * 50 + "\n\n")
+                
+                horas_int = int(total_horas)
+                minutos_int = int((total_horas - horas_int) * 60)
+                f.write(f"TOTAL DE HORAS: {horas_int}h{minutos_int:02d}min ({total_horas:.2f} horas)\n\n")
+                
+                f.write("REGISTROS DETALHADOS:\n")
+                f.write("-" * 50 + "\n")
+                
+                for registro in registros:
+                    f.write(f"Data: {registro['data']}\n")
+                    f.write(f"Entrada: {registro['entrada']} | Saída: {registro['saida']}\n")
+                    f.write(f"Horas do dia: {registro['horas']}\n")
+                    f.write("-" * 30 + "\n")
+            
+            messagebox.showinfo("Exportar", f"Relatório de {usuario_nome} exportado com sucesso!")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro ao exportar: {str(e)}")
+    
+    tk.Button(botoes_frame, text="Exportar Relatório", font=('Times New Roman', 10),
+              command=exportar_relatorio_usuario, bg='#FF9800', fg='white',
+              padx=15, pady=8).pack(side='left', padx=5)
+    
+    # Botão para exportar todos os usuários
+    def exportar_todos_usuarios():
+        usuarios_dict = carregar_usuarios()
+        
+        try:
+            with open('relatorio_completo.txt', 'w', encoding='utf-8') as f:
+                f.write("RELATÓRIO COMPLETO DE HORAS\n")
+                f.write("=" * 50 + "\n\n")
+                
+                for usuario_nome in usuarios_dict.keys():
+                    total_horas, registros = calcular_horas_usuario(usuario_nome)
+                    
+                    if total_horas > 0 or registros:
+                        horas_int = int(total_horas)
+                        minutos_int = int((total_horas - horas_int) * 60)
+                        f.write(f"USUÁRIO: {usuario_nome}\n")
+                        f.write(f"TOTAL: {horas_int}h{minutos_int:02d}min ({total_horas:.2f} horas)\n")
+                        f.write(f"REGISTROS: {len(registros)}\n")
+                        f.write("-" * 40 + "\n\n")
+            
+            messagebox.showinfo("Exportar", "Relatório completo exportado com sucesso!")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro ao exportar: {str(e)}")
+    
+    tk.Button(botoes_frame, text="Exportar Todos", font=('Times New Roman', 10),
+              command=exportar_todos_usuarios, bg='#9C27B0', fg='white',
+              padx=15, pady=8).pack(side='left', padx=5)
+    
+    # Botão Voltar
+    def voltar_dados():
+        dados.destroy()
+        app.deiconify()
+    
+    tk.Button(main_frame, text="Voltar ao Menu Principal", 
+              font=('Times New Roman', 10, 'bold'),
+              command=voltar_dados, bg='#757575', fg='white',
+              padx=20, pady=10).pack(pady=10)
+    
+    dados.protocol("WM_DELETE_WINDOW", voltar_dados)
+    
+    # Selecionar primeiro usuário se existir
+    if lista_usuarios.size() > 0:
+        lista_usuarios.selection_set(0)
+        lista_usuarios.activate(0)
+        dados.after(100, exibir_detalhes_usuario)
+
+def usuarios():
+    app.withdraw()
+    usuario = tk.Toplevel()
+    usuario.title('SIIE - Gerenciamento de Usuários')
+    usuario.geometry('600x700')
+    usuario.resizable(False, False)
+    
+    # Frame principal
+    main_frame = tk.Frame(usuario)
+    main_frame.pack(fill='both', expand=True, padx=20, pady=20)
+    
+    # Título
+    titulo_frame = tk.Frame(main_frame)
+    titulo_frame.pack(fill='x', pady=(0, 20))
+    
+    tk.Label(titulo_frame, text='GERENCIAMENTO DE USUÁRIOS', 
+             font=('Times New Roman', 18, 'bold')).pack()
+    tk.Label(titulo_frame, text='Adicione, edite ou remova usuários do sistema',
+             font=('Times New Roman', 10)).pack()
+    
+    # Frame para lista de usuários
+    lista_frame = tk.Frame(main_frame)
+    lista_frame.pack(fill='both', expand=True, pady=(0, 20))
+    
+    tk.Label(lista_frame, text='Usuários Cadastrados:', 
+             font=('Times New Roman', 12, 'bold')).pack(anchor='w')
+    
+    # Lista com scrollbar
+    lista_container = tk.Frame(lista_frame)
+    lista_container.pack(fill='both', expand=True, pady=5)
+    
+    lista_usuarios = tk.Listbox(lista_container, font=('Times New Roman', 11), height=8)
+    scrollbar = tk.Scrollbar(lista_container)
+    lista_usuarios.configure(yscrollcommand=scrollbar.set)
+    scrollbar.config(command=lista_usuarios.yview)
+    
+    lista_usuarios.pack(side='left', fill='both', expand=True)
+    scrollbar.pack(side='right', fill='y')
+    
+    # Atualizar lista
+    def atualizar_lista():
+        lista_usuarios.delete(0, tk.END)
+        usuarios_carregados = carregar_usuarios()
+        for nome, info in usuarios_carregados.items():
+            matricula = info.get('matricula', 'N/A')
+            lista_usuarios.insert(tk.END, f"{nome} | Matrícula: {matricula}")
+    
+    atualizar_lista()
+    
+    # Frame para formulário
+    form_frame = tk.Frame(main_frame)
+    form_frame.pack(fill='x', pady=(0, 20))
+    
+    tk.Label(form_frame, text='Novo Usuário:', 
+             font=('Times New Roman', 12, 'bold')).pack(anchor='w', pady=(0, 10))
+    
+    # Campos do formulário
+    campos = [
+        ("Nome Completo*:", "entry_nome"),
+        ("Data Nascimento:", "entry_nasc"),
+        ("Estágio Obrigatório?:", "entry_estagio"),
+        ("Matrícula*:", "entry_matricula"),
+        ("Email:", "entry_email"),
+        ("Supervisor:", "entry_supervisor")
+    ]
+    
+    entries = {}
+    for i, (label_text, var_name) in enumerate(campos):
+        frame_campo = tk.Frame(form_frame)
+        frame_campo.pack(fill='x', pady=3)
+        
+        tk.Label(frame_campo, text=label_text, width=20, anchor='w', font=('Times New Roman', 10)).pack(side='left')
+        entry = tk.Entry(frame_campo, font=('Times New Roman', 10), width=40)
+        entry.pack(side='left', padx=5, fill='x', expand=True)
+        entries[var_name] = entry
+    
+    # Funções
+    def adicionar_usuario():
+        nome = entries['entry_nome'].get().strip()
+        matricula = entries['entry_matricula'].get().strip()
+        
+        if not nome:
+            messagebox.showerror("Erro", "Nome é obrigatório!")
+            return
+        if not matricula:
+            messagebox.showerror("Erro", "Matrícula é obrigatória!")
+            return
+        
+        usuarios_atual = carregar_usuarios()
+        
+        if nome in usuarios_atual:
+            if not messagebox.askyesno("Confirmar", f"Usuário {nome} já existe. Substituir?"):
+                return
+        
+        usuarios_atual[nome] = {
+            'nascimento': entries['entry_nasc'].get(),
+            'estagio': entries['entry_estagio'].get(),
+            'matricula': matricula,
+            'email': entries['entry_email'].get(),
+            'supervisor': entries['entry_supervisor'].get(),
+            'data_cadastro': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        salvar_usuarios(usuarios_atual)
+        atualizar_lista()
+        
+        # Limpar campos
+        for entry in entries.values():
+            entry.delete(0, tk.END)
+        
+        messagebox.showinfo("Sucesso", f"Usuário {nome} adicionado!")
+    
+    def remover_usuario():
+        selecao = lista_usuarios.curselection()
+        if not selecao:
+            messagebox.showwarning("Aviso", "Selecione um usuário para remover!")
+            return
+        
+        item = lista_usuarios.get(selecao[0])
+        nome = item.split(' | ')[0]
+        
+        if messagebox.askyesno("Confirmar", f"Remover usuário {nome}?"):
+            usuarios_atual = carregar_usuarios()
+            if nome in usuarios_atual:
+                del usuarios_atual[nome]
+                salvar_usuarios(usuarios_atual)
+                atualizar_lista()
+                messagebox.showinfo("Sucesso", f"Usuário {nome} removido!")
+    
+    def editar_usuario():
+        selecao = lista_usuarios.curselection()
+        if not selecao:
+            messagebox.showwarning("Aviso", "Selecione um usuário para editar!")
+            return
+        
+        item = lista_usuarios.get(selecao[0])
+        nome = item.split(' | ')[0]
+        
+        usuarios_atual = carregar_usuarios()
+        if nome in usuarios_atual:
+            info = usuarios_atual[nome]
+            
+            # Preencher campos com dados do usuário
+            entries['entry_nome'].delete(0, tk.END)
+            entries['entry_nome'].insert(0, nome)
+            entries['entry_nasc'].delete(0, tk.END)
+            entries['entry_nasc'].insert(0, info.get('nascimento', ''))
+            entries['entry_estagio'].delete(0, tk.END)
+            entries['entry_estagio'].insert(0, info.get('estagio', ''))
+            entries['entry_matricula'].delete(0, tk.END)
+            entries['entry_matricula'].insert(0, info.get('matricula', ''))
+            entries['entry_email'].delete(0, tk.END)
+            entries['entry_email'].insert(0, info.get('email', ''))
+            entries['entry_supervisor'].delete(0, tk.END)
+            entries['entry_supervisor'].insert(0, info.get('supervisor', ''))
+            
+            messagebox.showinfo("Editar", f"Preencha os campos para editar {nome}")
+    
+    # Frame para botões de ação
+    acoes_frame = tk.Frame(main_frame)
+    acoes_frame.pack(fill='x', pady=(0, 20))
+    
+    tk.Button(acoes_frame, text="Adicionar", font=('Times New Roman', 10),
+              command=adicionar_usuario, bg='#4CAF50', fg='white',
+              padx=15, pady=5).pack(side='left', padx=5)
+    
+    tk.Button(acoes_frame, text="Editar", font=('Times New Roman', 10),
+              command=editar_usuario, bg='#FF9800', fg='white',
+              padx=15, pady=5).pack(side='left', padx=5)
+    
+    tk.Button(acoes_frame, text="Remover", font=('Times New Roman', 10),
+              command=remover_usuario, bg='#F44336', fg='white',
+              padx=15, pady=5).pack(side='left', padx=5)
+    
+    tk.Button(acoes_frame, text="Atualizar Lista", font=('Times New Roman', 10),
+              command=atualizar_lista, bg='#2196F3', fg='white',
+              padx=15, pady=5).pack(side='left', padx=5)
+    
+    # Botão Voltar
+    def voltar_usuarios():
+        usuario.destroy()
+        app.deiconify()
+    
+    tk.Button(main_frame, text="Voltar ao Menu Principal", font=('Times New Roman', 10),
+              command=voltar_usuarios, bg='#757575', fg='white',
+              padx=20, pady=8).pack(pady=10)
+    
+    usuario.protocol("WM_DELETE_WINDOW", voltar_usuarios)
+
+def gerenciar():
+    app.withdraw()
+    gerencia = tk.Toplevel()
+    gerencia.title('SIIE - Gerenciamento de Cartões RFID')
+    gerencia.geometry('550x700')
+    gerencia.resizable(False, True)
+    
+    # Frame principal com scrollbar
+    main_canvas = tk.Canvas(gerencia)
+    scrollbar = tk.Scrollbar(gerencia, orient="vertical", command=main_canvas.yview)
+    scrollable_frame = tk.Frame(main_canvas)
+    
+    scrollable_frame.bind(
+        "<Configure>",
+        lambda e: main_canvas.configure(scrollregion=main_canvas.bbox("all"))
+    )
+    
+    main_canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+    main_canvas.configure(yscrollcommand=scrollbar.set)
+    
+    main_canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+    
+    # Título
+    titulo_frame = tk.Frame(scrollable_frame)
+    titulo_frame.pack(fill='x', padx=20, pady=(20, 10))
+    
+    tk.Label(titulo_frame, text='GERENCIAMENTO DE CARTÕES RFID', 
+             font=('Times New Roman', 18, 'bold')).pack()
+    tk.Label(titulo_frame, text='Associe cartões RFID aos usuários',
+             font=('Times New Roman', 10)).pack()
+    
+    # Carregar dados
+    cartoes_atual = carregar_cartoes()
+    usuarios_atual = carregar_usuarios()
+    nomes_usuarios = list(usuarios_atual.keys())
+    
+    # Variáveis para armazenar seleções
+    cartao_vars = {}
+    
+    # Frame para cartões
+    cartoes_frame = tk.Frame(scrollable_frame)
+    cartoes_frame.pack(fill='x', padx=20, pady=10)
+    
+    # Criar widgets para cada cartão
+    for uid, info in cartoes_atual.items():
+        # Frame para cada cartão
+        frame_cartao = tk.Frame(cartoes_frame, relief='groove', borderwidth=2, 
+                               bg='#f8f9fa', padx=15, pady=10)
+        frame_cartao.pack(fill='x', pady=8, padx=5)
+        
+        # UID do cartão
+        uid_frame = tk.Frame(frame_cartao, bg='#f8f9fa')
+        uid_frame.pack(fill='x', pady=(0, 10))
+        
+        tk.Label(uid_frame, text=f"Cartão UID: {uid}", 
+                font=('Times New Roman', 11, 'bold'), bg='#f8f9fa').pack(side='left')
+        
+        # Status do cartão
+        var_ativo = tk.BooleanVar(value=info.get('ativo', True))
+        check_ativo = tk.Checkbutton(uid_frame, text="Ativo", 
+                                    variable=var_ativo,
+                                    font=('Times New Roman', 9), bg='#f8f9fa')
+        check_ativo.pack(side='right')
+        
+        # Dono do cartão
+        tk.Label(frame_cartao, text="Usuário Associado:", 
+                font=('Times New Roman', 10), bg='#f8f9fa').pack(anchor='w')
+        
+        # ComboBox para selecionar usuário
+        combo_dono = ttk.Combobox(frame_cartao, 
+                                 values=nomes_usuarios,
+                                 font=('Times New Roman', 10),
+                                 state='readonly')
+        combo_dono.set(info.get('dono', ''))
+        combo_dono.pack(fill='x', pady=5)
+        
+        # Status atual
+        dono_atual = info.get('dono', '')
+        if dono_atual:
+            status_text = f"Associado a: {dono_atual}"
+        else:
+            status_text = "Sem associação"
+        
+        tk.Label(frame_cartao, text=status_text, 
+                font=('Times New Roman', 9), bg='#f8f9fa', fg='#666').pack(anchor='w')
+        
+        # Armazenar referências
+        cartao_vars[uid] = {'ativo': var_ativo, 'dono_combo': combo_dono}
+    
+    # Frame para botões de gerenciamento
+    botoes_frame = tk.Frame(scrollable_frame)
+    botoes_frame.pack(fill='x', padx=20, pady=20)
+    
+    # Função para salvar alterações
+    def salvar_alteracoes():
+        for uid, vars in cartao_vars.items():
+            cartoes_atual[uid]['ativo'] = vars['ativo'].get()
+            cartoes_atual[uid]['dono'] = vars['dono_combo'].get()
+        
+        salvar_cartoes(cartoes_atual)
+        messagebox.showinfo("Sucesso", "Alterações salvas com sucesso!")
+    
+    # Botão para salvar
+    tk.Button(botoes_frame, text="Salvar Todas as Alterações", 
+              font=('Times New Roman', 11, 'bold'),
+              command=salvar_alteracoes, bg='#4CAF50', fg='white',
+              padx=20, pady=10).pack(fill='x')
+    
+    # Separador
+    tk.Frame(scrollable_frame, height=2, bg='#ddd').pack(fill='x', padx=20, pady=10)
+    
+    # Seção para registro manual de ponto
+    registro_frame = tk.Frame(scrollable_frame)
+    registro_frame.pack(fill='x', padx=20, pady=10)
+    
+    tk.Label(registro_frame, text='REGISTRO MANUAL DE PONTO', 
+             font=('Times New Roman', 14, 'bold')).pack(anchor='w', pady=(0, 10))
+    
+    tk.Label(registro_frame, text='Registre entrada/saída manualmente:',
+             font=('Times New Roman', 10)).pack(anchor='w')
+    
+    def abrir_registro_manual():
+        janela_registro = tk.Toplevel(gerencia)
+        janela_registro.title("Registro Manual de Ponto")
+        janela_registro.geometry("400x500")
+        janela_registro.resizable(False, False)
+        
+        # Frame principal
+        main_frame_reg = tk.Frame(janela_registro, padx=20, pady=20)
+        main_frame_reg.pack(fill='both', expand=True)
+        
+        tk.Label(main_frame_reg, text="Registro Manual", 
+                font=('Times New Roman', 16, 'bold')).pack(pady=(0, 20))
+        
+        # Campos
+        campos_reg = []
+        
+        # Usuário
+        tk.Label(main_frame_reg, text="Usuário*:", 
+                font=('Times New Roman', 10)).pack(anchor='w')
+        combo_user = ttk.Combobox(main_frame_reg, values=nomes_usuarios, 
+                                 font=('Times New Roman', 10))
+        combo_user.pack(fill='x', pady=(0, 15))
+        campos_reg.append(combo_user)
+        
+        # Data
+        tk.Label(main_frame_reg, text="Data (DD/MM/AAAA)*:", 
+                font=('Times New Roman', 10)).pack(anchor='w')
+        entry_data = tk.Entry(main_frame_reg, font=('Times New Roman', 10))
+        entry_data.insert(0, datetime.now().strftime("%d/%m/%Y"))
+        entry_data.pack(fill='x', pady=(0, 15))
+        campos_reg.append(entry_data)
+        
+        # Hora Entrada
+        tk.Label(main_frame_reg, text="Hora Entrada (HH:MM)*:", 
+                font=('Times New Roman', 10)).pack(anchor='w')
+        entry_entrada = tk.Entry(main_frame_reg, font=('Times New Roman', 10))
+        entry_entrada.insert(0, "08:00")
+        entry_entrada.pack(fill='x', pady=(0, 15))
+        campos_reg.append(entry_entrada)
+        
+        # Hora Saída
+        tk.Label(main_frame_reg, text="Hora Saída (HH:MM)*:", 
+                font=('Times New Roman', 10)).pack(anchor='w')
+        entry_saida = tk.Entry(main_frame_reg, font=('Times New Roman', 10))
+        entry_saida.insert(0, "17:00")
+        entry_saida.pack(fill='x', pady=(0, 15))
+        campos_reg.append(entry_saida)
+        
+        # Cartão
+        tk.Label(main_frame_reg, text="Cartão UID:", 
+                font=('Times New Roman', 10)).pack(anchor='w')
+        combo_cartao = ttk.Combobox(main_frame_reg, 
+                                   values=list(cartoes_atual.keys()), font=('Times New Roman', 10))
+        combo_cartao.pack(fill='x', pady=(0, 20))
+        campos_reg.append(combo_cartao)
+        
+        def salvar_registro():
+            try:
+                usuario = combo_user.get()
+                data_str = entry_data.get()
+                entrada_str = entry_entrada.get()
+                saida_str = entry_saida.get()
+                cartao = combo_cartao.get()
+                
+                if not all([usuario, data_str, entrada_str, saida_str]):
+                    messagebox.showerror("Erro", "Preencha todos os campos obrigatórios!")
+                    return
+                
+                # Carregar dados existentes
+                df = carregar_dados_xlsx()
+                
+                # Calcular horas
+                entrada_dt = datetime.strptime(f"{data_str} {entrada_str}", "%d/%m/%Y %H:%M")
+                saida_dt = datetime.strptime(f"{data_str} {saida_str}", "%d/%m/%Y %H:%M")
+                
+                if saida_dt <= entrada_dt:
+                    messagebox.showerror("Erro", "Hora de saída deve ser maior que entrada!")
+                    return
+                
+                horas = saida_dt - entrada_dt
+                
+                # Adicionar ao DataFrame
+                novo_registro = {
+                    'Usuario': usuario,
+                    'Data': data_str,
+                    'Entrada': entrada_str,
+                    'Saida': saida_str,
+                    'Horas': str(horas),
+                    'Cartao': cartao if cartao else "Manual"
+                }
+                
+                df = df._append(novo_registro, ignore_index=True)
+                salvar_dados_xlsx(df)
+                
+                messagebox.showinfo("Sucesso", "Ponto registrado com sucesso!")
+                janela_registro.destroy()
+                
+            except ValueError:
+                messagebox.showerror("Erro", "Formato inválido! Use DD/MM/AAAA e HH:MM")
+            except Exception as e:
+                messagebox.showerror("Erro", f"Erro: {str(e)}")
+        
+        # Botões
+        botoes_frame_reg = tk.Frame(main_frame_reg)
+        botoes_frame_reg.pack(fill='x', pady=10)
+        
+        tk.Button(botoes_frame_reg, text="Salvar Registro", 
+                 command=salvar_registro, bg='#4CAF50', fg='white',
+                 padx=15, pady=8, font=('Times New Roman', 10)).pack(side='left')
+        
+        def fechar_registro():
+            janela_registro.destroy()
+        
+        tk.Button(botoes_frame_reg, text="Cancelar", 
+                 command=fechar_registro, bg='#F44336', fg='white',
+                 padx=15, pady=8, font=('Times New Roman', 10)).pack(side='right')
+    
+    # Botão para registro manual
+    tk.Button(registro_frame, text="Registrar Ponto Manual", 
+              font=('Times New Roman', 10),
+              command=abrir_registro_manual, bg='#2196F3', fg='white',
+              padx=15, pady=8).pack()
+    
+    # Botão Voltar
+    def voltar_gerencia():
+        gerencia.destroy()
+        app.deiconify()
+    
+    tk.Button(scrollable_frame, text="Voltar ao Menu Principal", 
+              font=('Times New Roman', 10),
+              command=voltar_gerencia, bg='#757575', fg='white',
+              padx=20, pady=10).pack(pady=20)
+    
+    gerencia.protocol("WM_DELETE_WINDOW", voltar_gerencia)
+
+def simulador_rfid():
+    """Função para simular leitura de cartões RFID"""
+    app.withdraw()
+    simulador = tk.Toplevel()
+    simulador.title('SIIE - Simulador RFID')
+    simulador.geometry('500x450')
+    simulador.resizable(False, False)
+    
+    # Frame principal
+    main_frame = tk.Frame(simulador, padx=20, pady=20)
+    main_frame.pack(fill='both', expand=True)
+    
+    # Título
+    tk.Label(main_frame, text='SIMULADOR RFID', 
+             font=('Times New Roman', 18, 'bold')).pack(pady=(0, 10))
+    
+    tk.Label(main_frame, text='Simule a leitura de cartões RFID para testes',
+             font=('Times New Roman', 10)).pack(pady=(0, 20))
+    
+    # Carregar dados
+    cartoes_atual = carregar_cartoes()
+    
+    # Frame para seleção de cartão
+    selecao_frame = tk.Frame(main_frame)
+    selecao_frame.pack(fill='x', pady=10)
+    
+    tk.Label(selecao_frame, text="Selecione o cartão:", 
+             font=('Times New Roman', 11)).pack(anchor='w')
+    
+    combo_cartoes = ttk.Combobox(selecao_frame, 
+                                 values=list(cartoes_atual.keys()),
+                                 font=('Times New Roman', 11))
+    combo_cartoes.pack(fill='x', pady=5)
+    
+    # Frame para informações
+    info_frame = tk.Frame(main_frame, relief='groove', borderwidth=2, 
+                         bg='#f0f0f0', padx=15, pady=15)
+    info_frame.pack(fill='x', pady=20)
+    
+    info_text = tk.StringVar()
+    info_text.set("Selecione um cartão para ver informações")
+    
+    tk.Label(info_frame, textvariable=info_text, 
+             font=('Times New Roman', 10), bg='#f0f0f0', 
+             wraplength=400, justify='left').pack()
+    
+    # Frame para resultado
+    resultado_frame = tk.Frame(main_frame, bg='#e8f5e9', 
+                              relief='solid', borderwidth=1)
+    resultado_frame.pack(fill='x', pady=10)
+    
+    resultado_text = tk.StringVar()
+    resultado_text.set("")
+    
+    tk.Label(resultado_frame, textvariable=resultado_text, 
+             font=('Times New Roman', 11, 'bold'), bg='#e8f5e9',
+             padx=10, pady=10).pack()
+    
+    # Função para atualizar informações
+    def atualizar_info():
+        uid = combo_cartoes.get()
+        if not uid:
+            info_text.set("Selecione um cartão para ver informações")
+            return
+        
+        cartao_info = cartoes_atual.get(uid, {})
+        dono = cartao_info.get('dono', '')
+        ativo = cartao_info.get('ativo', False)
+        
+        status = "ATIVO" if ativo else "INATIVO"
+        dono_info = f"{dono}" if dono else "Sem dono"
+        
+        info_text.set(f"Cartão: {uid}\nStatus: {status}\n{dono_info}")
+    
+    combo_cartoes.bind('<<ComboboxSelected>>', lambda e: atualizar_info())
+    
+    # Função para registrar leitura
+    def registrar_leitura():
+        uid = combo_cartoes.get()
+        if not uid:
+            messagebox.showwarning("Aviso", "Selecione um cartão!")
+            return
+        
+        cartao_info = cartoes_atual.get(uid)
+        if not cartao_info:
+            resultado_text.set("Cartão não encontrado!")
+            return
+        
+        if not cartao_info.get('ativo', True):
+            resultado_text.set("Cartão INATIVO!")
+            return
+        
+        dono = cartao_info.get('dono', '')
+        if not dono:
+            resultado_text.set("Cartão sem dono associado!")
+            return
+        
+        # Registrar ponto
+        agora = datetime.now()
+        data_str = agora.strftime("%d/%m/%Y")
+        hora_str = agora.strftime("%H:%M")
+        
+        df = carregar_dados_xlsx()
+        
+        # Filtrar registros
+        registros_hoje = df[
+            (df['Usuario'] == dono) & 
+            (df['Data'] == data_str)
+        ]
+        
+        if registros_hoje.empty or registros_hoje['Saida'].notna().all():
+            # Entrada
+            novo_registro = {
+                'Usuario': dono,
+                'Data': data_str,
+                'Entrada': hora_str,
+                'Saida': '',
+                'Horas': '',
+                'Cartao': uid
+            }
+            df = df._append(novo_registro, ignore_index=True)
+            resultado_text.set(f"ENTRADA registrada\n{dono}\n{hora_str}")
+        else:
+            # Saída
+            idx = registros_hoje.index[-1]
+            entrada_str = df.at[idx, 'Entrada']
+            df.at[idx, 'Saida'] = hora_str
+            
+            try:
+                entrada_dt = datetime.strptime(f"{data_str} {entrada_str}", "%d/%m/%Y %H:%M")
+                saida_dt = datetime.strptime(f"{data_str} {hora_str}", "%d/%m/%Y %H:%M")
+                horas = saida_dt - entrada_dt
+                df.at[idx, 'Horas'] = str(horas)
+                
+                horas_total = horas.seconds // 3600
+                minutos_total = (horas.seconds % 3600) // 60
+                resultado_text.set(f"SAÍDA registrada\n{dono}\n{hora_str}\nTotal: {horas_total}h{minutos_total:02d}min")
+            except:
+                df.at[idx, 'Horas'] = 'Erro no cálculo'
+                resultado_text.set(f"SAÍDA registrada\n{dono}\n{hora_str}")
+        
+        salvar_dados_xlsx(df)
+        atualizar_info()
+    
+    # Frame para botões
+    botoes_frame = tk.Frame(main_frame)
+    botoes_frame.pack(fill='x', pady=20)
+    
+    tk.Button(botoes_frame, text="Simular Leitura RFID", 
+              font=('Times New Roman', 11, 'bold'),
+              command=registrar_leitura, bg='#9C27B0', fg='white',
+              padx=20, pady=10).pack(fill='x')
+    
+    # Botão Voltar
+    def voltar_simulador():
+        simulador.destroy()
+        app.deiconify()
+    
+    tk.Button(main_frame, text="Voltar ao Menu Principal", 
+              font=('Times New Roman', 10),
+              command=voltar_simulador, bg='#757575', fg='white',
+              padx=15, pady=8).pack()
+    
+    simulador.protocol("WM_DELETE_WINDOW", voltar_simulador)
+
+def sair_aplicativo():
+    """Função para sair do aplicativo"""
+    if messagebox.askyesno("Sair", "Deseja realmente sair do SIIE?"):
+        app.quit()
+
+# ========== INTERFACE PRINCIPAL ==========
+
+# Configurar estilo da janela principal
+try:
+    # Tentar carregar imagem de fundo
+    ar1 = Image.open(r"D:\Projetos\Alpha\SIIE\WhatsApp Image 2025-12-07 at 16.04.48.jpeg")
+    ar1 = ar1.resize((500, 700), Image.Resampling.LANCZOS)
+    background_image = ImageTk.PhotoImage(ar1)
+    background_label = tk.Label(app, image=background_image)
+    background_label.place(x=0, y=0, relwidth=1, relheight=1)
+except Exception as e:
+    print(f"Erro ao carregar imagem de fundo: {e}")
+    # Se não conseguir, usar cor de fundo
+    app.configure(bg='#2c3e50')
+
+# Frame principal para conteúdo
+main_content = tk.Frame(app, bg='white')
+main_content.place(relx=0.5, rely=0.5, anchor='center', width=450, height=600)
+
+# Cabeçalho
+header_frame = tk.Frame(main_content, bg='#3498db', height=100)
+header_frame.pack(fill='x')
+header_frame.pack_propagate(False)
+
+tk.Label(header_frame, text='SIIE', font=('Times New Roman', 32, 'bold'), 
+         bg='#3498db', fg='white').pack(expand=True)
+
+tk.Label(header_frame, text='Sistema Interno de Informações de Estagio', 
+         font=('Times New Roman', 10), bg='#3498db', fg='white').pack(pady=(0, 10))
+
+# Frame para botões principais
+buttons_frame = tk.Frame(main_content, bg='white', padx=30, pady=30)
+buttons_frame.pack(fill='both', expand=True)
+
+# Botões principais com ícones
+botoes_menu = [
+    ("Dados e Relatórios", dadoss, "#2ecc71"),
+    ("Gerenciar Usuários", usuarios, "#e74c3c"),
+    ("Gerenciar Cartões RFID", gerenciar, "#f39c12"),
+    ("Simulador RFID", simulador_rfid, "#9b59b6"),
+    ("Sair do Sistema", sair_aplicativo, "#7f8c8d")
+]
+
+for texto, comando, cor in botoes_menu:
+    btn = tk.Button(buttons_frame, text=texto, font=('Times New Roman', 12, 'bold'),
+                    command=comando, bg=cor, fg='white',
+                    padx=20, pady=12, width=25,
+                    cursor='hand2')
+    btn.pack(pady=8)
+    # Efeito hover simples
+    btn.bind("<Enter>", lambda e, b=btn: b.config(bg='#34495e'))
+    btn.bind("<Leave>", lambda e, b=btn, c=cor: b.config(bg=c))
+
+# Status do sistema
+status_frame = tk.Frame(main_content, bg='#ecf0f1', height=80)
+status_frame.pack(fill='x', side='bottom')
+status_frame.pack_propagate(False)
+
+status_inner = tk.Frame(status_frame, bg='#ecf0f1', padx=20, pady=10)
+status_inner.pack(expand=True)
+
+# Carregar dados para status
+usuarios_status = carregar_usuarios()
+cartoes_status = carregar_cartoes()
+dados_status = carregar_dados_xlsx()
+
+tk.Label(status_inner, text=f"{len(usuarios_status)} usuários | ", 
+         font=('Times New Roman', 9), bg='#ecf0f1').pack(side='left')
+tk.Label(status_inner, text=f"{len(cartoes_status)} cartões | ", 
+         font=('Times New Roman', 9), bg='#ecf0f1').pack(side='left')
+tk.Label(status_inner, text=f"{len(dados_status)} registros", 
+         font=('Times New Roman', 9), bg='#ecf0f1').pack(side='left')
+
+# Rodapé
+footer_frame = tk.Frame(app, bg='#2c3e50', height=30)
+footer_frame.pack(side='bottom', fill='x')
+footer_frame.pack_propagate(False)
+
+tk.Label(footer_frame, text='SIIE v2.0 © 2025 - Sistema Interno de Informações de Estagio', 
+         font=('Times New Roman', 8), bg='#2c3e50', fg='#bdc3c7').pack(expand=True)
+
+# Centralizar janela na tela
+app.eval('tk::PlaceWindow . center')
+
+# Iniciar aplicação
+print("SIIE iniciando...")
+app.mainloop()
