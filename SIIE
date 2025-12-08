@@ -6,6 +6,7 @@ import os
 import json
 from datetime import datetime
 import sys
+import re
 
 # Janela Principal
 app = tk.Tk()
@@ -144,6 +145,42 @@ def calcular_horas_usuario(usuario_nome):
             continue
     
     return total_horas, registros_detalhados
+
+# ========== FUNÇÃO PARA ADICIONAR CARTÃO ==========
+
+def adicionar_cartao(uid, dono="", ativo=True):
+    """Adiciona um novo cartão ao sistema"""
+    # Validar formato do UID
+    if not uid or not uid.strip():
+        return False, "UID do cartão não pode ser vazio!"
+    
+    # Remover espaços extras e formatar
+    uid = uid.strip().upper()
+    
+    # Validar formato básico (pode conter letras, números e espaços)
+    if not re.match(r'^[A-F0-9\s]+$', uid):
+        return False, "UID deve conter apenas letras A-F, números 0-9 e espaços!"
+    
+    # Carregar cartões existentes
+    cartoes = carregar_cartoes()
+    
+    # Verificar se cartão já existe
+    if uid in cartoes:
+        return False, f"Cartão com UID '{uid}' já existe no sistema!"
+    
+    # Adicionar novo cartão
+    cartoes[uid] = {
+        "dono": dono,
+        "ativo": ativo,
+        "data_cadastro": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    
+    # Salvar alterações
+    try:
+        salvar_cartoes(cartoes)
+        return True, f"Cartão '{uid}' adicionado com sucesso!"
+    except Exception as e:
+        return False, f"Erro ao salvar cartão: {str(e)}"
 
 # ========== FUNÇÕES PRINCIPAIS COM INTERFACES ORGANIZADAS ==========
 
@@ -696,6 +733,65 @@ def gerenciar():
               font=('Times New Roman', 11, 'bold'),
               command=salvar_alteracoes, bg='#4CAF50', fg='white',
               padx=20, pady=10).pack(fill='x')
+    
+    # Frame para adicionar novo cartão
+    adicionar_frame = tk.Frame(scrollable_frame)
+    adicionar_frame.pack(fill='x', padx=20, pady=20)
+    
+    tk.Label(adicionar_frame, text='ADICIONAR NOVO CARTÃO', 
+             font=('Times New Roman', 14, 'bold')).pack(anchor='w', pady=(0, 10))
+    
+    # Formulário para novo cartão
+    form_novo_frame = tk.Frame(adicionar_frame)
+    form_novo_frame.pack(fill='x')
+    
+    # Campo UID
+    uid_frame = tk.Frame(form_novo_frame)
+    uid_frame.pack(fill='x', pady=5)
+    tk.Label(uid_frame, text="UID do Cartão*:", 
+             font=('Times New Roman', 10), width=15, anchor='w').pack(side='left')
+    entry_uid = tk.Entry(uid_frame, font=('Times New Roman', 10))
+    entry_uid.pack(side='left', fill='x', expand=True, padx=5)
+    
+    # Campo Usuário
+    user_frame = tk.Frame(form_novo_frame)
+    user_frame.pack(fill='x', pady=5)
+    tk.Label(user_frame, text="Usuário:", 
+             font=('Times New Roman', 10), width=15, anchor='w').pack(side='left')
+    combo_novo_user = ttk.Combobox(user_frame, values=nomes_usuarios,
+                                  font=('Times New Roman', 10))
+    combo_novo_user.pack(side='left', fill='x', expand=True, padx=5)
+    
+    # Checkbox Ativo
+    ativo_var = tk.BooleanVar(value=True)
+    check_novo_ativo = tk.Checkbutton(form_novo_frame, text="Cartão Ativo",
+                                     variable=ativo_var, font=('Times New Roman', 10))
+    check_novo_ativo.pack(anchor='w', pady=5)
+    
+    # Botão para adicionar
+    def adicionar_novo_cartao():
+        uid = entry_uid.get().strip()
+        dono = combo_novo_user.get()
+        ativo = ativo_var.get()
+        
+        sucesso, mensagem = adicionar_cartao(uid, dono, ativo)
+        
+        if sucesso:
+            messagebox.showinfo("Sucesso", mensagem)
+            # Limpar campos
+            entry_uid.delete(0, tk.END)
+            combo_novo_user.set('')
+            ativo_var.set(True)
+            # Recarregar interface
+            gerencia.destroy()
+            gerenciar()
+        else:
+            messagebox.showerror("Erro", mensagem)
+    
+    tk.Button(form_novo_frame, text="Adicionar Cartão", 
+              font=('Times New Roman', 10, 'bold'),
+              command=adicionar_novo_cartao, bg='#2196F3', fg='white',
+              padx=15, pady=8).pack(pady=10)
     
     # Separador
     tk.Frame(scrollable_frame, height=2, bg='#ddd').pack(fill='x', padx=20, pady=10)
