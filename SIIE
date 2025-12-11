@@ -4,13 +4,19 @@ from PIL import Image, ImageTk
 import pandas as pd
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import sys
 import re
+import serial
+import serial.tools.list_ports
+import threading
+import time
+from queue import Queue
+import traceback
 
-# Janela Principal
+# ========== CONFIGURAÇÃO INICIAL ==========
 app = tk.Tk()
-app.title('SIIE - Sistema Interno de Informações de Estagio')
+app.title('SIIE - Sistema Interno de Informações de Estágio')
 app.geometry('500x700')
 app.resizable(False, False)
 
@@ -18,9 +24,31 @@ app.resizable(False, False)
 USERS_FILE = "usuarios.json"
 DATA_FILE = "dados.xlsx"
 CARTOES_FILE = "cartoes.json"
+LOG_FILE = "log_rfid.txt"
 
-# ========== FUNÇÕES DE CARREGAMENTO ==========
+# ========== VARIÁVEIS GLOBAIS ==========
+ser = None
+serial_thread = None
+running = False
+current_connection_status = "Desconectado"
+auto_connect_enabled = False
+auto_connect_thread = None
+serial_lock = threading.Lock()  # Lock para sincronizar acesso serial
+reconnect_attempts = 0
+MAX_RECONNECT_ATTEMPTS = 5
 
+# ========== FUNÇÕES DE LOG ==========
+def log_event(mensagem):
+    """Registra eventos no arquivo de log"""
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(f"[{timestamp}] {mensagem}\n")
+        print(f"[LOG] {mensagem}")
+    except Exception as e:
+        print(f"Erro ao registrar log: {e}")
+
+# ========== FUNÇÕES DE CARREGAMENTO/SAVAMENTO ==========
 def carregar_usuarios():
     """Carrega usuários do arquivo JSON"""
     if os.path.exists(USERS_FILE):
@@ -82,8 +110,7 @@ def salvar_dados_xlsx(df):
     except Exception as e:
         print(f"Erro ao salvar dados Excel: {e}")
 
-# ========== FUNÇÃO PARA CALCULAR HORAS DE UM USUÁRIO ==========
-
+# ========== FUNÇÃO PARA CALCULAR HORAS ==========
 def calcular_horas_usuario(usuario_nome):
     """Calcula o total de horas de um usuário específico"""
     df = carregar_dados_xlsx()
@@ -91,46 +118,41 @@ def calcular_horas_usuario(usuario_nome):
     if df.empty:
         return 0.0, []
     
-    # Filtrar registros do usuário
     registros_usuario = df[df['Usuario'] == usuario_nome]
     
     if registros_usuario.empty:
         return 0.0, []
     
-    # Converter horas para timedelta e calcular total
     total_horas = 0.0
     registros_detalhados = []
     
     for idx, row in registros_usuario.iterrows():
         try:
             horas_str = str(row['Horas'])
-            if horas_str and horas_str != 'nan' and horas_str != 'NaT':
-                # Converter string para timedelta
-                if 'day' in horas_str:
-                    # Formato com dias
-                    partes = horas_str.split()
-                    dias = int(partes[0])
-                    tempo = partes[2]
-                    horas, minutos, segundos = map(int, tempo.split(':'))
-                    total_segundos = dias * 86400 + horas * 3600 + minutos * 60 + segundos
-                else:
-                    # Formato HH:MM:SS
-                    try:
+            if horas_str and horas_str not in ['nan', 'NaT', '']:
+                # Converter para timedelta
+                try:
+                    if 'day' in horas_str:
+                        # Formato com dias
+                        partes = horas_str.split()
+                        dias = int(partes[0])
+                        tempo = partes[2]
+                        horas, minutos, segundos = map(int, tempo.split(':'))
+                        total_segundos = dias * 86400 + horas * 3600 + minutos * 60 + segundos
+                    else:
+                        # Formato HH:MM:SS
                         horas, minutos, segundos = map(int, horas_str.split(':'))
                         total_segundos = horas * 3600 + minutos * 60 + segundos
+                except:
+                    try:
+                        td = pd.Timedelta(horas_str)
+                        total_segundos = td.total_seconds()
                     except:
-                        # Tentar outro formato
-                        try:
-                            from datetime import timedelta
-                            td = pd.Timedelta(horas_str)
-                            total_segundos = td.total_seconds()
-                        except:
-                            continue
+                        continue
                 
                 horas_totais = total_segundos / 3600
                 total_horas += horas_totais
                 
-                # Formatar para exibição
                 horas_int = int(horas_totais)
                 minutos_int = int((horas_totais - horas_int) * 60)
                 
@@ -146,96 +168,1003 @@ def calcular_horas_usuario(usuario_nome):
     
     return total_horas, registros_detalhados
 
-# ========== FUNÇÃO PARA ADICIONAR CARTÃO ==========
-
+# ========== FUNÇÕES PARA ADICIONAR/EDITAR CARTÃO ==========
 def adicionar_cartao(uid, dono="", ativo=True):
     """Adiciona um novo cartão ao sistema"""
-    # Validar formato do UID
     if not uid or not uid.strip():
         return False, "UID do cartão não pode ser vazio!"
     
-    # Remover espaços extras e formatar
     uid = uid.strip().upper()
     
-    # Validar formato básico (pode conter letras, números e espaços)
     if not re.match(r'^[A-F0-9\s]+$', uid):
         return False, "UID deve conter apenas letras A-F, números 0-9 e espaços!"
     
-    # Carregar cartões existentes
     cartoes = carregar_cartoes()
     
-    # Verificar se cartão já existe
     if uid in cartoes:
         return False, f"Cartão com UID '{uid}' já existe no sistema!"
     
-    # Adicionar novo cartão
     cartoes[uid] = {
         "dono": dono,
         "ativo": ativo,
         "data_cadastro": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     
-    # Salvar alterações
     try:
         salvar_cartoes(cartoes)
         return True, f"Cartão '{uid}' adicionado com sucesso!"
     except Exception as e:
         return False, f"Erro ao salvar cartão: {str(e)}"
 
-# ========== FUNÇÕES PRINCIPAIS COM INTERFACES ORGANIZADAS ==========
+def editar_uid_cartao(uid_antigo, uid_novo):
+    """Edita o UID de um cartão existente"""
+    if not uid_antigo or not uid_antigo.strip():
+        return False, "UID antigo não pode ser vazio!"
+    
+    if not uid_novo or not uid_novo.strip():
+        return False, "Novo UID não pode ser vazio!"
+    
+    uid_antigo = uid_antigo.strip().upper()
+    uid_novo = uid_novo.strip().upper()
+    
+    if uid_antigo == uid_novo:
+        return False, "O novo UID deve ser diferente do UID atual!"
+    
+    # Validação do formato do novo UID
+    if not re.match(r'^[A-F0-9\s]+$', uid_novo):
+        return False, "Novo UID deve conter apenas letras A-F, números 0-9 e espaços!"
+    
+    # Carregar dados
+    cartoes = carregar_cartoes()
+    dados = carregar_dados_xlsx()
+    
+    # Verificar se o cartão antigo existe
+    if uid_antigo not in cartoes:
+        return False, f"Cartão com UID '{uid_antigo}' não encontrado!"
+    
+    # Verificar se o novo UID já existe
+    if uid_novo in cartoes:
+        return False, f"Já existe um cartão com o UID '{uid_novo}'!"
+    
+    try:
+        # Salvar informações do cartão antigo
+        info_cartao = cartoes[uid_antigo]
+        
+        # Remover cartão antigo
+        del cartoes[uid_antigo]
+        
+        # Adicionar cartão com novo UID
+        cartoes[uid_novo] = info_cartao
+        cartoes[uid_novo]['data_modificacao'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Atualizar registros no arquivo de dados
+        if not dados.empty and 'Cartao' in dados.columns:
+            # Substituir o UID antigo pelo novo nos registros
+            dados.loc[dados['Cartao'] == uid_antigo, 'Cartao'] = uid_novo
+        
+        # Salvar alterações
+        salvar_cartoes(cartoes)
+        salvar_dados_xlsx(dados)
+        
+        log_event(f"UID do cartão alterado: '{uid_antigo}' → '{uid_novo}'")
+        return True, f"UID do cartão alterado com sucesso de '{uid_antigo}' para '{uid_novo}'!"
+        
+    except Exception as e:
+        log_event(f"Erro ao editar UID do cartão: {e}")
+        return False, f"Erro ao editar UID do cartão: {str(e)}"
 
+# ========== FUNÇÕES DE COMUNICAÇÃO SERIAL - CORRIGIDAS ==========
+def listar_portas_serial():
+    """Lista todas as portas seriais disponíveis"""
+    portas = []
+    try:
+        for port in serial.tools.list_ports.comports():
+            portas.append(port.device)
+        log_event(f"Portas encontradas: {portas}")
+    except Exception as e:
+        log_event(f"Erro ao listar portas: {e}")
+    return portas
+
+def formatar_uid(uid_raw):
+    """Formata um UID para o padrão correto (ex: A7 D6 DE D7)"""
+    try:
+        # Remover todos os caracteres não hexadecimais
+        uid_limpo = re.sub(r'[^A-Fa-f0-9]', '', uid_raw).upper()
+        
+        if not uid_limpo:
+            return None
+        
+        # Garantir comprimento par (normalmente 8 caracteres para RFID)
+        if len(uid_limpo) % 2 != 0:
+            uid_limpo = uid_limpo[:-1]
+        
+        # Formatar em pares separados por espaço
+        partes = [uid_limpo[i:i+2] for i in range(0, len(uid_limpo), 2)]
+        uid_formatado = ' '.join(partes)
+        
+        return uid_formatado
+    except Exception as e:
+        log_event(f"Erro ao formatar UID '{uid_raw}': {e}")
+        return None
+
+def safe_serial_close():
+    """Fecha a conexão serial de forma segura"""
+    global ser, running
+    
+    with serial_lock:
+        running = False
+        if ser:
+            try:
+                ser.reset_input_buffer()
+                ser.reset_output_buffer()
+                time.sleep(0.1)
+                ser.close()
+                ser = None
+                log_event("Conexão serial fechada com segurança")
+            except Exception as e:
+                log_event(f"Erro ao fechar serial: {e}")
+            finally:
+                ser = None
+
+def conectar_arduino(porta, baudrate=9600):
+    """Conecta ao Arduino via Serial - VERSÃO CORRIGIDA"""
+    global ser, running, current_connection_status, reconnect_attempts
+    
+    # Fecha conexão existente primeiro
+    safe_serial_close()
+    time.sleep(1.0)  # Aguarda para garantir liberação da porta
+    
+    try:
+        log_event(f"Tentando conectar na porta {porta} com baudrate {baudrate}")
+        
+        # Configurações robustas para evitar problemas de permissão
+        ser = serial.Serial(
+            port=porta,
+            baudrate=baudrate,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=2.0,
+            write_timeout=2.0,
+            xonxoff=False,
+            rtscts=False,
+            dsrdtr=False
+        )
+        
+        # Aguarda inicialização
+        time.sleep(2.5)
+        
+        # Limpa buffers completamente
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+        
+        # Testa a conexão
+        ser.write(b"\n")  # Envia um simples newline para sincronizar
+        time.sleep(0.5)
+        
+        # Lê qualquer resposta pendente
+        if ser.in_waiting:
+            resposta = ser.read(ser.in_waiting)
+            log_event(f"Resposta inicial do Arduino: {resposta}")
+        
+        running = True
+        current_connection_status = "Conectado"
+        reconnect_attempts = 0
+        
+        # Inicia thread de leitura
+        iniciar_thread_leitura()
+        
+        log_event(f"Conectado à porta {porta} com sucesso")
+        return True, f"Conectado à {porta}"
+        
+    except PermissionError as e:
+        erro_msg = f"Permissão negada na porta {porta}. Feche outros programas usando a porta."
+        log_event(erro_msg)
+        current_connection_status = "Erro de Permissão"
+        safe_serial_close()
+        return False, erro_msg
+    except serial.SerialException as e:
+        erro_msg = f"Erro na conexão serial {porta}: {str(e)}"
+        log_event(erro_msg)
+        current_connection_status = "Erro"
+        safe_serial_close()
+        return False, erro_msg
+    except Exception as e:
+        erro_msg = f"Erro inesperado: {str(e)}"
+        log_event(erro_msg)
+        current_connection_status = "Erro"
+        safe_serial_close()
+        return False, erro_msg
+
+def desconectar_arduino():
+    """Desconecta do Arduino de forma segura"""
+    global running, current_connection_status, auto_connect_enabled
+    
+    log_event("Desconectando Arduino...")
+    auto_connect_enabled = False
+    current_connection_status = "Desconectado"
+    
+    safe_serial_close()
+    
+    if serial_thread and serial_thread.is_alive():
+        try:
+            serial_thread.join(timeout=2.0)
+        except:
+            pass
+    
+    log_event("Arduino desconectado com sucesso")
+
+def iniciar_thread_leitura():
+    """Inicia thread para leitura serial"""
+    global serial_thread
+    
+    if serial_thread and serial_thread.is_alive():
+        try:
+            serial_thread.join(timeout=1.0)
+        except:
+            pass
+    
+    serial_thread = threading.Thread(target=ler_serial, daemon=True)
+    serial_thread.start()
+    log_event("Thread de leitura serial iniciada")
+
+def ler_serial():
+    """Thread para leitura contínua da serial - VERSÃO SUPER ROBUSTA"""
+    global running, ser, current_connection_status, reconnect_attempts
+    
+    log_event("Thread de leitura serial iniciada")
+    
+    buffer = ""
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 10
+    
+    while running:
+        try:
+            with serial_lock:
+                if not ser or not ser.is_open:
+                    log_event("Porta serial não está aberta")
+                    time.sleep(1)
+                    continue
+                
+                # Lê dados disponíveis
+                if ser.in_waiting > 0:
+                    try:
+                        # Lê todos os bytes disponíveis
+                        data = ser.read(ser.in_waiting)
+                        
+                        # Decodifica para string
+                        try:
+                            decoded_data = data.decode('utf-8', errors='ignore')
+                            buffer += decoded_data
+                            consecutive_errors = 0  # Reseta contador de erros
+                        except UnicodeDecodeError:
+                            log_event("Erro de decodificação - tentando latin-1")
+                            decoded_data = data.decode('latin-1', errors='ignore')
+                            buffer += decoded_data
+                        
+                        # Processa linhas completas
+                        while '\n' in buffer or '\r' in buffer:
+                            # Encontra o fim da linha
+                            if '\n' in buffer:
+                                linha, buffer = buffer.split('\n', 1)
+                            else:
+                                linha, buffer = buffer.split('\r', 1)
+                            
+                            linha = linha.strip()
+                            
+                            if linha:
+                                log_event(f"Dados recebidos: {linha}")
+                                
+                                # Processa UID
+                                uid_formatado = formatar_uid(linha)
+                                if uid_formatado:
+                                    log_event(f"UID processado: {uid_formatado}")
+                                    app.after(0, lambda uid=uid_formatado: processar_cartao_rfid(uid))
+                                else:
+                                    # Tenta extrair UID de mensagens do sistema
+                                    uid_matches = re.findall(r'([A-F0-9]{8,})', linha.upper())
+                                    for uid_match in uid_matches:
+                                        uid_formatado = formatar_uid(uid_match)
+                                        if uid_formatado:
+                                            log_event(f"UID extraído: {uid_formatado}")
+                                            app.after(0, lambda uid=uid_formatado: processar_cartao_rfid(uid))
+                                            break
+                    
+                    except (serial.SerialException, OSError) as e:
+                        consecutive_errors += 1
+                        log_event(f"Erro de leitura #{consecutive_errors}: {e}")
+                        
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                            log_event(f"Muitos erros consecutivos. Reconectando...")
+                            current_connection_status = "Reconectando"
+                            safe_serial_close()
+                            time.sleep(2)
+                            break
+                
+                # Pequena pausa para evitar uso excessivo de CPU
+                time.sleep(0.01)
+                
+        except Exception as e:
+            log_event(f"Erro inesperado na leitura serial: {e}")
+            log_event(f"Traceback: {traceback.format_exc()}")
+            time.sleep(0.5)
+    
+    log_event("Thread de leitura serial finalizada")
+    
+    # Tenta reconectar se ainda estiver rodando
+    if running and current_connection_status == "Reconectando":
+        app.after(1000, tentar_reconexao_automatica)
+
+def tentar_reconexao_automatica():
+    """Tenta reconectar automaticamente"""
+    global reconnect_attempts, current_connection_status, auto_connect_enabled
+    
+    if auto_connect_enabled and current_connection_status != "Conectado":
+        if reconnect_attempts < MAX_RECONNECT_ATTEMPTS:
+            reconnect_attempts += 1
+            log_event(f"Tentativa de reconexão #{reconnect_attempts}")
+            mostrar_notificacao(f"Reconectando... Tentativa {reconnect_attempts}", "orange")
+            conectar_automaticamente_arduino()
+        else:
+            log_event("Máximo de tentativas de reconexão atingido")
+            mostrar_notificacao("Falha na conexão. Verifique o Arduino", "red")
+
+def enviar_feedback_arduino(mensagem):
+    """Envia feedback para o Arduino de forma segura"""
+    global ser
+    
+    if not ser or not ser.is_open:
+        return
+    
+    with serial_lock:
+        try:
+            ser.write(f"{mensagem}\n".encode())
+            ser.flush()
+            log_event(f"Feedback enviado: {mensagem}")
+        except Exception as e:
+            log_event(f"Erro ao enviar feedback: {e}")
+
+# ========== FUNÇÕES DE CONEXÃO AUTOMÁTICA ==========
+def conectar_automaticamente_arduino():
+    """Tenta conectar automaticamente ao Arduino - VERSÃO CORRIGIDA"""
+    global current_connection_status, auto_connect_enabled, ser, running
+    
+    if not auto_connect_enabled:
+        return False
+    
+    if current_connection_status == "Conectado":
+        return True
+    
+    log_event("Iniciando conexão automática...")
+    current_connection_status = "Conectando"
+    
+    # Fecha conexão existente
+    safe_serial_close()
+    time.sleep(1.0)
+    
+    portas = listar_portas_serial()
+    
+    if not portas:
+        log_event("Nenhuma porta serial disponível")
+        mostrar_notificacao("Nenhuma porta serial encontrada", "orange")
+        current_connection_status = "Desconectado"
+        return False
+    
+    log_event(f"Portas disponíveis: {portas}")
+    
+    # Evita portas problemáticas
+    portas_evitar = ['COM1', 'COM2']  # COM1/COM2 podem ser virtuais no Windows
+    portas_validas = [p for p in portas if p not in portas_evitar]
+    
+    if not portas_validas:
+        portas_validas = portas
+    
+    baudrates = [9600, 115200, 57600, 38400, 19200, 14400, 28800]
+    
+    for porta in portas_validas:
+        for baudrate in baudrates:
+            try:
+                log_event(f"Testando {porta} @ {baudrate}...")
+                
+                # Tenta conectar
+                sucesso, mensagem = conectar_arduino(porta, baudrate)
+                
+                if sucesso:
+                    log_event(f"Conexão automática bem-sucedida: {porta}")
+                    mostrar_notificacao(f"Conectado a {porta}", "green")
+                    return True
+                else:
+                    log_event(f"Falha em {porta}@{baudrate}: {mensagem}")
+                    
+            except Exception as e:
+                log_event(f"Erro ao testar {porta}: {e}")
+                time.sleep(0.5)
+    
+    log_event("Conexão automática falhou em todas as portas")
+    current_connection_status = "Desconectado"
+    mostrar_notificacao("Não foi possível conectar ao Arduino", "red")
+    return False
+
+def iniciar_conexao_automatica():
+    """Inicia a thread de conexão automática"""
+    global auto_connect_enabled, auto_connect_thread
+    
+    if auto_connect_enabled:
+        return
+    
+    auto_connect_enabled = True
+    
+    def thread_conexao_automatica():
+        log_event("Thread de conexão automática iniciada")
+        
+        while auto_connect_enabled:
+            if current_connection_status != "Conectado":
+                conectar_automaticamente_arduino()
+            
+            # Verifica a cada 10 segundos se precisa reconectar
+            for _ in range(20):  # 20 * 0.5 = 10 segundos
+                if not auto_connect_enabled:
+                    break
+                time.sleep(0.5)
+    
+    if auto_connect_thread is None or not auto_connect_thread.is_alive():
+        auto_connect_thread = threading.Thread(target=thread_conexao_automatica, daemon=True)
+        auto_connect_thread.start()
+
+def parar_conexao_automatica():
+    """Para a conexão automática"""
+    global auto_connect_enabled
+    auto_connect_enabled = False
+    log_event("Conexão automática desativada")
+
+def reconectar_manualmente():
+    """Tenta reconectar manualmente ao Arduino"""
+    global current_connection_status
+    
+    if current_connection_status == "Conectado":
+        messagebox.showinfo("Informação", "Já conectado ao Arduino!")
+        return
+    
+    log_event("Tentativa de reconexão manual iniciada")
+    mostrar_notificacao("Tentando reconectar...", "blue")
+    
+    # Para conexão automática temporariamente
+    auto_connect_temp = auto_connect_enabled
+    parar_conexao_automatica()
+    
+    sucesso = conectar_automaticamente_arduino()
+    
+    # Restaura configuração anterior
+    if auto_connect_temp:
+        iniciar_conexao_automatica()
+    
+    if sucesso:
+        messagebox.showinfo("Sucesso", "Reconectado com sucesso!")
+    else:
+        messagebox.showwarning("Aviso", "Não foi possível reconectar. Verifique:\n1. Arduino está ligado\n2. Cabo USB está conectado\n3. Nenhum outro programa usando a porta\n4. Drivers instalados corretamente")
+
+# ========== PROCESSAMENTO DE CARTÕES RFID ==========
+def processar_cartao_rfid(uid):
+    """Processa leitura do cartão RFID"""
+    try:
+        log_event(f"=== PROCESSANDO CARTÃO RFID ===")
+        log_event(f"UID recebido: '{uid}'")
+        
+        cartoes = carregar_cartoes()
+        usuarios = carregar_usuarios()
+        
+        log_event(f"Total de cartões no sistema: {len(cartoes)}")
+        
+        # Normalizar o UID
+        uid_normalizado = ' '.join(uid.split())
+        
+        # Verificar se cartão existe
+        cartao_encontrado = None
+        cartao_info = None
+        
+        if uid_normalizado in cartoes:
+            cartao_encontrado = uid_normalizado
+            cartao_info = cartoes[uid_normalizado]
+        else:
+            uid_sem_espacos = uid_normalizado.replace(' ', '')
+            for cartao_uid in cartoes.keys():
+                if cartao_uid.replace(' ', '') == uid_sem_espacos:
+                    cartao_encontrado = cartao_uid
+                    cartao_info = cartoes[cartao_uid]
+                    break
+        
+        if not cartao_encontrado:
+            log_event(f"Cartão NÃO cadastrado: '{uid_normalizado}'")
+            mostrar_notificacao(f"Cartão não cadastrado: {uid_normalizado}", "red")
+            enviar_feedback_arduino("NAO_CADASTRADO")
+            return
+        
+        log_event(f"Cartão encontrado: {cartao_encontrado}")
+        
+        # Verifica se cartão está ativo
+        if not cartao_info.get('ativo', True):
+            log_event(f"Cartão INATIVO: {cartao_encontrado}")
+            mostrar_notificacao(f"Cartão inativo: {cartao_encontrado}", "orange")
+            enviar_feedback_arduino("INATIVO")
+            return
+        
+        # Verifica se tem dono
+        dono = cartao_info.get('dono', '')
+        if not dono:
+            log_event(f"Cartão SEM DONO: {cartao_encontrado}")
+            mostrar_notificacao(f"Cartão sem dono associado", "orange")
+            enviar_feedback_arduino("SEM_DONO")
+            return
+        
+        # Verificar se dono existe
+        if dono not in usuarios:
+            log_event(f"ERRO: Dono '{dono}' não encontrado nos usuários")
+            mostrar_notificacao(f"Usuário não encontrado: {dono}", "red")
+            enviar_feedback_arduino("SEM_DONO")
+            return
+        
+        log_event(f"Cartão válido - Dono: {dono}")
+        
+        # Registra ponto
+        registrar_ponto_automatico(dono, cartao_encontrado)
+        
+        log_event(f"Cartão processado com sucesso: {cartao_encontrado} - Dono: {dono}")
+        
+    except Exception as e:
+        log_event(f"ERRO ao processar cartão: {e}")
+        log_event(traceback.format_exc())
+        mostrar_notificacao(f"Erro ao processar cartão", "red")
+
+def registrar_ponto_automatico(usuario, uid):
+    """Registra entrada/saída automaticamente"""
+    try:
+        agora = datetime.now()
+        data_str = agora.strftime("%d/%m/%Y")
+        hora_str = agora.strftime("%H:%M")
+        
+        log_event(f"Tentando registrar ponto para {usuario}")
+        log_event(f"Data: {data_str}, Hora: {hora_str}")
+        
+        df = carregar_dados_xlsx()
+        
+        log_event(f"DataFrame atual - Total registros: {len(df)}")
+        
+        # Filtra registros do usuário HOJE
+        registros_hoje = df[
+            (df['Usuario'] == usuario) & 
+            (df['Data'] == data_str)
+        ]
+        
+        log_event(f"Registros de hoje para {usuario}: {len(registros_hoje)}")
+        
+        # Determinar se é entrada ou saída
+        if registros_hoje.empty:
+            # Primeiro registro do dia - ENTRADA
+            log_event(f"Primeiro registro do dia - Registrando ENTRADA")
+            
+            novo_registro = {
+                'Usuario': usuario,
+                'Data': data_str,
+                'Entrada': hora_str,
+                'Saida': '',
+                'Horas': '',
+                'Cartao': uid
+            }
+            df = pd.concat([df, pd.DataFrame([novo_registro])], ignore_index=True)
+            
+            mensagem = f"ENTRADA registrada\n{usuario}\n{hora_str}"
+            mostrar_notificacao(mensagem, "green")
+            enviar_feedback_arduino("ENTRADA_OK")
+            log_event(f"Entrada registrada com sucesso: {usuario} - {hora_str}")
+            
+        else:
+            # Verificar o último registro
+            ultimo_registro = registros_hoje.iloc[-1]
+            log_event(f"Último registro:\n{ultimo_registro}")
+            
+            # Verificar se já tem saída registrada
+            saida_vazia = pd.isna(ultimo_registro['Saida']) or str(ultimo_registro['Saida']).strip() == ''
+            
+            if saida_vazia:
+                # Tem entrada mas não tem saída - registrar SAÍDA
+                log_event(f"Registro sem saída - Registrando SAÍDA")
+                
+                idx = registros_hoje.index[-1]
+                entrada_str = str(df.at[idx, 'Entrada'])
+                df.at[idx, 'Saida'] = hora_str
+                
+                try:
+                    entrada_dt = datetime.strptime(f"{data_str} {entrada_str}", "%d/%m/%Y %H:%M")
+                    saida_dt = datetime.strptime(f"{data_str} {hora_str}", "%d/%m/%Y %H:%M")
+                    
+                    if saida_dt <= entrada_dt:
+                        mostrar_notificacao("Hora de saída inválida", "orange")
+                        enviar_feedback_arduino("ERRO_HORA")
+                        return
+                    
+                    horas = saida_dt - entrada_dt
+                    df.at[idx, 'Horas'] = str(horas)
+                    
+                    horas_total = horas.seconds // 3600
+                    minutos_total = (horas.seconds % 3600) // 60
+                    
+                    mensagem = f"SAÍDA registrada\n{usuario}\n{hora_str}\nTotal: {horas_total}h{minutos_total:02d}min"
+                    mostrar_notificacao(mensagem, "blue")
+                    enviar_feedback_arduino("SAIDA_OK")
+                    log_event(f"Saída registrada: {usuario} - {hora_str} - Total: {horas_total}h{minutos_total:02d}min")
+                    
+                except Exception as e:
+                    df.at[idx, 'Horas'] = 'Erro no cálculo'
+                    mensagem = f"SAÍDA registrada\n{usuario}\n{hora_str}\n(Erro no cálculo)"
+                    mostrar_notificacao(mensagem, "orange")
+                    enviar_feedback_arduino("ERRO_CALCULO")
+                    log_event(f"Erro no cálculo de horas: {e}")
+            else:
+                # Já tem entrada e saída - registrar nova ENTRADA
+                log_event(f"Já tem entrada e saída - Registrando NOVA ENTRADA")
+                
+                novo_registro = {
+                    'Usuario': usuario,
+                    'Data': data_str,
+                    'Entrada': hora_str,
+                    'Saida': '',
+                    'Horas': '',
+                    'Cartao': uid
+                }
+                df = pd.concat([df, pd.DataFrame([novo_registro])], ignore_index=True)
+                
+                mensagem = f"ENTRADA registrada\n{usuario}\n{hora_str}"
+                mostrar_notificacao(mensagem, "green")
+                enviar_feedback_arduino("ENTRADA_OK")
+                log_event(f"Nova entrada registrada: {usuario} - {hora_str}")
+        
+        # Salva dados
+        salvar_dados_xlsx(df)
+        log_event(f"Dados salvos com sucesso")
+        
+    except Exception as e:
+        log_event(f"ERRO ao registrar ponto: {e}")
+        log_event(traceback.format_exc())
+        mostrar_notificacao(f"Erro ao registrar ponto", "red")
+        enviar_feedback_arduino("ERRO_GERAL")
+
+# ========== TESTE DE COMUNICAÇÃO SERIAL ==========
+def testar_comunicacao_serial():
+    """Testa a comunicação serial com o Arduino"""
+    if not ser or not ser.is_open:
+        messagebox.showwarning("Aviso", "Não conectado ao Arduino!")
+        return
+    
+    try:
+        with serial_lock:
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            
+            ser.write(b"TEST\n")
+            ser.flush()
+            
+            time.sleep(0.5)
+            
+            if ser.in_waiting > 0:
+                resposta = ser.readline().decode('utf-8', errors='ignore').strip()
+                log_event(f"Resposta do Arduino: {resposta}")
+                messagebox.showinfo("Teste", f"Conexão OK!\nArduino respondeu: {resposta}")
+            else:
+                log_event("Arduino não respondeu ao teste")
+                messagebox.showwarning("Teste", "Arduino não respondeu. Verifique a conexão.")
+                
+    except Exception as e:
+        log_event(f"Erro no teste de comunicação: {e}")
+        messagebox.showerror("Erro", f"Falha na comunicação: {e}")
+
+# ========== NOTIFICAÇÃO NA INTERFACE PRINCIPAL ==========
+notif_var = tk.StringVar()
+notif_var.set("Sistema pronto. Configure a conexão Arduino.")
+
+def mostrar_notificacao(mensagem, cor="black"):
+    """Mostra notificação na interface principal"""
+    notif_var.set(mensagem)
+    
+    if hasattr(app, 'notif_label'):
+        app.notif_label.config(fg=cor)
+    
+    app.after(5000, lambda: notif_var.set("Aguardando cartão RFID..."))
+
+# ========== INTERFACE DE CONFIGURAÇÃO SERIAL ==========
+def configuracao_serial():
+    """Janela de configuração da conexão serial"""
+    config_janela = tk.Toplevel(app)
+    config_janela.title("Configuração de Conexão Arduino")
+    config_janela.geometry("675x700")
+    config_janela.resizable(False, False)
+    
+    # Frame principal com scroll
+    main_frame = tk.Frame(config_janela)
+    main_frame.pack(fill='both', expand=True)
+    
+    canvas = tk.Canvas(main_frame)
+    scrollbar = tk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+    scrollable_frame = tk.Frame(canvas)
+    
+    scrollable_frame.bind(
+        "<Configure>",
+        lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+    )
+    
+    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+    
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+    
+    def _on_mousewheel(event):
+        canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+    
+    canvas.bind_all("<MouseWheel>", _on_mousewheel)
+    
+    # Título
+    tk.Label(scrollable_frame, text="CONEXÃO COM ARDUINO RFID", 
+             font=('Times New Roman', 16, 'bold')).pack(pady=(20, 10))
+    
+    # Frame para conexão automática
+    auto_frame = tk.Frame(scrollable_frame, padx=20)
+    auto_frame.pack(fill='x', pady=(0, 15))
+    
+    tk.Label(auto_frame, text="Conexão Automática:", 
+             font=('Times New Roman', 11, 'bold')).pack(anchor='w')
+    
+    auto_desc = tk.Label(auto_frame, 
+                        text="O sistema tentará detectar e conectar automaticamente ao Arduino",
+                        font=('Times New Roman', 9), wraplength=400, justify='left')
+    auto_desc.pack(anchor='w', pady=(0, 10))
+    
+    auto_buttons_frame = tk.Frame(auto_frame)
+    auto_buttons_frame.pack(fill='x')
+    
+    def ativar_auto_conexao():
+        iniciar_conexao_automatica()
+        mostrar_notificacao("Conexão automática ativada", "green")
+        log_event("Conexão automática ativada pelo usuário")
+    
+    def desativar_auto_conexao():
+        parar_conexao_automatica()
+        mostrar_notificacao("Conexão automática desativada", "orange")
+        log_event("Conexão automática desativada pelo usuário")
+    
+    tk.Button(auto_buttons_frame, text="Ativar Conexão Automática", 
+              font=('Times New Roman', 9),
+              command=ativar_auto_conexao, bg='#4CAF50', fg='white',
+              padx=10, pady=5).pack(side='left', padx=5)
+    
+    tk.Button(auto_buttons_frame, text="Desativar Conexão Automática", 
+              font=('Times New Roman', 9),
+              command=desativar_auto_conexao, bg='#F44336', fg='white',
+              padx=10, pady=5).pack(side='left', padx=5)
+    
+    tk.Frame(scrollable_frame, height=2, bg='#ddd').pack(fill='x', padx=20, pady=10)
+    
+    # Frame para seleção de porta
+    porta_frame = tk.Frame(scrollable_frame, padx=20)
+    porta_frame.pack(fill='x', pady=10)
+    
+    tk.Label(porta_frame, text="Porta Serial (COM):", 
+             font=('Times New Roman', 11)).pack(anchor='w')
+    
+    porta_combo = ttk.Combobox(porta_frame, font=('Times New Roman', 11))
+    porta_combo.pack(fill='x', pady=5)
+    
+    def atualizar_portas():
+        portas = listar_portas_serial()
+        if portas:
+            porta_combo['values'] = portas
+            if portas:
+                porta_combo.set(portas[0])
+        else:
+            porta_combo['values'] = ["Nenhuma porta encontrada"]
+            porta_combo.set("Nenhuma porta encontrada")
+    
+    tk.Button(porta_frame, text="Atualizar Portas", 
+              font=('Times New Roman', 9),
+              command=atualizar_portas, bg='#2196F3', fg='white').pack(pady=5)
+    
+    # Frame para configurações
+    config_frame = tk.Frame(scrollable_frame, padx=20)
+    config_frame.pack(fill='x', pady=10)
+    
+    baud_frame = tk.Frame(config_frame)
+    baud_frame.pack(fill='x', pady=5)
+    
+    tk.Label(baud_frame, text="Baudrate:", 
+             font=('Times New Roman', 11)).pack(side='left')
+    
+    baud_var = tk.StringVar(value="9600")
+    baud_combo = ttk.Combobox(baud_frame, textvariable=baud_var, 
+                              values=["9600", "115200", "57600", "38400", "19200"],
+                              font=('Times New Roman', 11), width=10, state='readonly')
+    baud_combo.pack(side='left', padx=10)
+    
+    # Status da conexão
+    status_frame = tk.Frame(scrollable_frame, padx=20)
+    status_frame.pack(fill='x', pady=15)
+    
+    status_var = tk.StringVar(value=current_connection_status)
+    
+    tk.Label(status_frame, text="Status da Conexão:", 
+             font=('Times New Roman', 11, 'bold')).pack(anchor='w')
+    
+    status_label = tk.Label(status_frame, textvariable=status_var, 
+                           font=('Times New Roman', 11, 'bold'))
+    status_label.pack(anchor='w', pady=5)
+    
+    def atualizar_status():
+        status_var.set(current_connection_status)
+        if current_connection_status == "Conectado":
+            status_label.config(fg='green')
+        elif current_connection_status == "Erro de Permissão":
+            status_label.config(fg='red')
+        elif current_connection_status in ["Conectando", "Reconectando"]:
+            status_label.config(fg='orange')
+        else:
+            status_label.config(fg='gray')
+        config_janela.after(1000, atualizar_status)
+    
+    # Log de eventos
+    log_frame = tk.Frame(scrollable_frame, padx=20)
+    log_frame.pack(fill='both', expand=True, pady=10)
+    
+    tk.Label(log_frame, text="Log de Eventos RFID:", 
+             font=('Times New Roman', 11, 'bold')).pack(anchor='w')
+    
+    log_text = tk.Text(log_frame, height=8, font=('Courier New', 9), wrap=tk.WORD)
+    scrollbar_log = tk.Scrollbar(log_frame)
+    log_text.configure(yscrollcommand=scrollbar_log.set)
+    scrollbar_log.config(command=log_text.yview)
+    
+    log_text.pack(side='left', fill='both', expand=True)
+    scrollbar_log.pack(side='right', fill='y')
+    
+    def atualizar_log():
+        try:
+            if os.path.exists(LOG_FILE):
+                with open(LOG_FILE, 'r', encoding='utf-8') as f:
+                    linhas = f.readlines()[-15:]
+                    log_text.delete(1.0, tk.END)
+                    for linha in linhas:
+                        log_text.insert(tk.END, linha)
+        except:
+            pass
+        
+        config_janela.after(2000, atualizar_log)
+    
+    # Funções dos botões
+    def conectar():
+        porta = porta_combo.get()
+        if not porta or "Nenhuma porta" in porta:
+            messagebox.showwarning("Aviso", "Selecione uma porta válida!")
+            return
+        
+        try:
+            baud = int(baud_var.get())
+        except:
+            baud = 9600
+        
+        sucesso, mensagem = conectar_arduino(porta, baud)
+        
+        if sucesso:
+            messagebox.showinfo("Sucesso", mensagem)
+        else:
+            messagebox.showerror("Erro", mensagem)
+    
+    def desconectar_interface():
+        desconectar_arduino()
+        messagebox.showinfo("Info", "Desconectado do Arduino")
+    
+    # Frame para botões
+    botoes_frame = tk.Frame(scrollable_frame, padx=20)
+    botoes_frame.pack(fill='x', pady=15)
+    
+    tk.Button(botoes_frame, text="Conectar", 
+              command=conectar, bg='#4CAF50', fg='white',
+              padx=15, pady=8, font=('Times New Roman', 10)).pack(side='left', padx=5)
+    
+    tk.Button(botoes_frame, text="Desconectar", 
+              command=desconectar_interface, bg='#F44336', fg='white',
+              padx=15, pady=8, font=('Times New Roman', 10)).pack(side='left', padx=5)
+    
+    tk.Button(botoes_frame, text="Testar Conexão", 
+              command=testar_comunicacao_serial, bg='#2196F3', fg='white',
+              padx=15, pady=8, font=('Times New Roman', 10)).pack(side='left', padx=5)
+    
+    tk.Button(botoes_frame, text="Reconectar", 
+              command=reconectar_manualmente, bg='#9C27B0', fg='white',
+              padx=15, pady=8, font=('Times New Roman', 10)).pack(side='left', padx=5)
+    
+    # Botão de solução de problemas
+    tk.Button(botoes_frame, text="Solução de Problemas", 
+              command=lambda: messagebox.showinfo("Solução de Problemas",
+              """1. Feche todos os programas usando a porta COM
+2. Reinicie o Arduino
+3. Tente outra porta USB
+4. Verifique drivers do Arduino
+5. Execute o programa como Administrador"""),
+              bg='#FF9800', fg='white',
+              padx=15, pady=8, font=('Times New Roman', 10)).pack(side='left', padx=5)
+    
+    # Inicializar
+    atualizar_portas()
+    atualizar_status()
+    atualizar_log()
+    
+    def fechar_janela():
+        config_janela.destroy()
+    
+    config_janela.protocol("WM_DELETE_WINDOW", fechar_janela)
+    config_janela.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
+
+# ========== INTERFACE DE DADOS E RELATÓRIOS ==========
 def dadoss():
     app.withdraw()
     dados = tk.Toplevel()
     dados.title('SIIE - Dados e Relatórios')
-    dados.geometry('1000x700')
-    dados.resizable(True, True)
+    dados.geometry('575x650')
+    dados.resizable(False, False)
     
-    # Frame principal
     main_frame = tk.Frame(dados)
-    main_frame.pack(fill='both', expand=True, padx=20, pady=20)
+    main_frame.pack(fill='both', expand=True)
     
-    # Título
-    titulo_frame = tk.Frame(main_frame)
-    titulo_frame.pack(fill='x', pady=(0, 20))
+    canvas = tk.Canvas(main_frame)
+    scrollbar = tk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+    scrollable_frame = tk.Frame(canvas)
+    
+    scrollable_frame.bind(
+        "<Configure>",
+        lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+    )
+    
+    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+    
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+    
+    def _on_mousewheel(event):
+        canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+    
+    canvas.bind_all("<MouseWheel>", _on_mousewheel)
+    
+    titulo_frame = tk.Frame(scrollable_frame, padx=20)
+    titulo_frame.pack(fill='x', pady=(20, 10))
     
     tk.Label(titulo_frame, text='DADOS E RELATÓRIOS', 
              font=('Times New Roman', 18, 'bold')).pack()
     tk.Label(titulo_frame, text='Selecione um usuário para ver suas horas detalhadas',
              font=('Times New Roman', 10)).pack()
     
-    # Frame para duas colunas
-    colunas_frame = tk.Frame(main_frame)
+    colunas_frame = tk.Frame(scrollable_frame, padx=20)
     colunas_frame.pack(fill='both', expand=True)
     
-    # Coluna da esquerda - Lista de usuários
-    coluna_esquerda = tk.Frame(colunas_frame, width=300, bg='#f5f5f5')
+    coluna_esquerda = tk.Frame(colunas_frame, bg='#f5f5f5')
     coluna_esquerda.pack(side='left', fill='both', padx=(0, 10))
-    coluna_esquerda.pack_propagate(False)
     
     tk.Label(coluna_esquerda, text='LISTA DE USUÁRIOS', 
              font=('Times New Roman', 12, 'bold'), bg='#f5f5f5', pady=10).pack()
     
-    # Frame para lista com scrollbar
     lista_frame = tk.Frame(coluna_esquerda)
     lista_frame.pack(fill='both', expand=True, padx=10, pady=10)
     
-    # Listbox para usuários
     lista_usuarios = tk.Listbox(lista_frame, font=('Times New Roman', 11), 
-                               selectmode='single', height=15)
-    scrollbar = tk.Scrollbar(lista_frame)
-    lista_usuarios.configure(yscrollcommand=scrollbar.set)
-    scrollbar.config(command=lista_usuarios.yview)
+                               selectmode='single', height=12)
+    scrollbar_lista = tk.Scrollbar(lista_frame)
+    lista_usuarios.configure(yscrollcommand=scrollbar_lista.set)
+    scrollbar_lista.config(command=lista_usuarios.yview)
     
     lista_usuarios.pack(side='left', fill='both', expand=True)
-    scrollbar.pack(side='right', fill='y')
+    scrollbar_lista.pack(side='right', fill='y')
     
-    # Carregar usuários
     usuarios_dict = carregar_usuarios()
     for usuario in usuarios_dict.keys():
         lista_usuarios.insert(tk.END, usuario)
     
-    # Frame para botões da coluna esquerda
     botoes_esquerda = tk.Frame(coluna_esquerda, bg='#f5f5f5', pady=10)
     botoes_esquerda.pack(fill='x', padx=10)
     
@@ -249,46 +1178,39 @@ def dadoss():
               command=atualizar_lista_usuarios, bg='#2196F3', fg='white',
               padx=10, pady=5).pack(fill='x')
     
-    # Coluna da direita - Detalhes do usuário selecionado
     coluna_direita = tk.Frame(colunas_frame)
     coluna_direita.pack(side='left', fill='both', expand=True)
     
-    # Frame para informações do usuário
     info_frame = tk.Frame(coluna_direita, relief='groove', borderwidth=2,
                          bg='#f8f9fa', padx=15, pady=15)
     info_frame.pack(fill='x', pady=(0, 20))
     
-    # Título da seção de horas
     titulo_horas = tk.Label(info_frame, text='Selecione um usuário à esquerda', 
                            font=('Times New Roman', 14, 'bold'), bg='#f8f9fa')
     titulo_horas.pack()
     
-    # Label para total de horas
     total_horas_var = tk.StringVar()
     total_horas_var.set('')
     label_total_horas = tk.Label(info_frame, textvariable=total_horas_var,
                                 font=('Times New Roman', 12), bg='#f8f9fa', fg='#2e7d32')
     label_total_horas.pack(pady=5)
     
-    # Frame para Treeview dos registros
     tree_frame = tk.Frame(coluna_direita)
     tree_frame.pack(fill='both', expand=True)
     
     tk.Label(tree_frame, text='REGISTROS DETALHADOS', 
              font=('Times New Roman', 12, 'bold')).pack(anchor='w', pady=(0, 10))
     
-    # Treeview para registros
     tree = ttk.Treeview(tree_frame, columns=('Data', 'Entrada', 'Saida', 'Horas'), 
-                        show='headings', height=10)
+                        show='headings', height=8)
     
     vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
     tree.configure(yscrollcommand=vsb.set)
     
-    # Definir cabeçalhos
-    colunas_tree = [('Data', 'Data', 100),
-                   ('Entrada', 'Entrada', 80),
-                   ('Saida', 'Saída', 80),
-                   ('Horas', 'Horas', 100)]
+    colunas_tree = [('Data', 'Data', 80),
+                   ('Entrada', 'Entrada', 70),
+                   ('Saida', 'Saída', 70),
+                   ('Horas', 'Horas', 90)]
     
     for col, texto, largura in colunas_tree:
         tree.heading(col, text=texto)
@@ -297,13 +1219,10 @@ def dadoss():
     tree.pack(side='left', fill='both', expand=True)
     vsb.pack(side='right', fill='y')
     
-    # Frame para botões de ação
-    botoes_frame = tk.Frame(coluna_direita)
+    botoes_frame = tk.Frame(scrollable_frame, padx=20)
     botoes_frame.pack(fill='x', pady=20)
     
-    # Função para exibir detalhes do usuário selecionado
     def exibir_detalhes_usuario(event=None):
-        # Limpar treeview
         for item in tree.get_children():
             tree.delete(item)
         
@@ -314,24 +1233,19 @@ def dadoss():
             return
         
         usuario_nome = lista_usuarios.get(selecao[0])
-        
-        # Atualizar título
         titulo_horas.config(text=f'{usuario_nome}')
         
-        # Calcular horas totais
         total_horas, registros = calcular_horas_usuario(usuario_nome)
         
-        # Exibir total de horas
         if total_horas > 0:
             horas_int = int(total_horas)
             minutos_int = int((total_horas - horas_int) * 60)
-            total_texto = f'TOTAL DE HORAS: {horas_int}h{minutos_int:02d}min ({total_horas:.2f} horas)'
+            total_texto = f'TOTAL: {horas_int}h{minutos_int:02d}min'
         else:
-            total_texto = 'TOTAL DE HORAS: 0h00min'
+            total_texto = 'TOTAL: 0h00min'
         
         total_horas_var.set(total_texto)
         
-        # Exibir registros na treeview
         if registros:
             for registro in registros:
                 tree.insert('', 'end', values=(
@@ -343,10 +1257,8 @@ def dadoss():
         else:
             tree.insert('', 'end', values=('Nenhum registro encontrado', '', '', ''))
     
-    # Vincular seleção da lista à função
     lista_usuarios.bind('<<ListboxSelect>>', exibir_detalhes_usuario)
     
-    # Botão para recalcular
     def recarregar_detalhes():
         exibir_detalhes_usuario()
     
@@ -354,7 +1266,6 @@ def dadoss():
               command=recarregar_detalhes, bg='#4CAF50', fg='white',
               padx=15, pady=8).pack(side='left', padx=5)
     
-    # Função para exportar relatório do usuário selecionado
     def exportar_relatorio_usuario():
         selecao = lista_usuarios.curselection()
         if not selecao:
@@ -381,7 +1292,6 @@ def dadoss():
                     f.write(f"Entrada: {registro['entrada']} | Saída: {registro['saida']}\n")
                     f.write(f"Horas do dia: {registro['horas']}\n")
                     f.write("-" * 30 + "\n")
-            
             messagebox.showinfo("Exportar", f"Relatório de {usuario_nome} exportado com sucesso!")
         except Exception as e:
             messagebox.showerror("Erro", f"Erro ao exportar: {str(e)}")
@@ -390,7 +1300,6 @@ def dadoss():
               command=exportar_relatorio_usuario, bg='#FF9800', fg='white',
               padx=15, pady=8).pack(side='left', padx=5)
     
-    # Botão para exportar todos os usuários
     def exportar_todos_usuarios():
         usuarios_dict = carregar_usuarios()
         
@@ -418,64 +1327,79 @@ def dadoss():
               command=exportar_todos_usuarios, bg='#9C27B0', fg='white',
               padx=15, pady=8).pack(side='left', padx=5)
     
-    # Botão Voltar
     def voltar_dados():
         dados.destroy()
         app.deiconify()
     
-    tk.Button(main_frame, text="Voltar ao Menu Principal", 
+    tk.Button(scrollable_frame, text="Voltar ao Menu Principal", 
               font=('Times New Roman', 10, 'bold'),
               command=voltar_dados, bg='#757575', fg='white',
-              padx=20, pady=10).pack(pady=10)
+              padx=20, pady=10).pack(pady=20)
     
     dados.protocol("WM_DELETE_WINDOW", voltar_dados)
+    dados.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
     
-    # Selecionar primeiro usuário se existir
     if lista_usuarios.size() > 0:
         lista_usuarios.selection_set(0)
         lista_usuarios.activate(0)
         dados.after(100, exibir_detalhes_usuario)
 
+# ========== INTERFACE DE GERENCIAMENTO DE USUÁRIOS ==========
 def usuarios():
     app.withdraw()
     usuario = tk.Toplevel()
     usuario.title('SIIE - Gerenciamento de Usuários')
-    usuario.geometry('600x700')
+    usuario.geometry('500x700')
     usuario.resizable(False, False)
     
-    # Frame principal
     main_frame = tk.Frame(usuario)
-    main_frame.pack(fill='both', expand=True, padx=20, pady=20)
+    main_frame.pack(fill='both', expand=True)
     
-    # Título
-    titulo_frame = tk.Frame(main_frame)
-    titulo_frame.pack(fill='x', pady=(0, 20))
+    canvas = tk.Canvas(main_frame)
+    scrollbar = tk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+    scrollable_frame = tk.Frame(canvas)
+    
+    scrollable_frame.bind(
+        "<Configure>",
+        lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+    )
+    
+    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+    
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+    
+    def _on_mousewheel(event):
+        canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+    
+    canvas.bind_all("<MouseWheel>", _on_mousewheel)
+    
+    titulo_frame = tk.Frame(scrollable_frame, padx=20)
+    titulo_frame.pack(fill='x', pady=(20, 10))
     
     tk.Label(titulo_frame, text='GERENCIAMENTO DE USUÁRIOS', 
              font=('Times New Roman', 18, 'bold')).pack()
     tk.Label(titulo_frame, text='Adicione, edite ou remova usuários do sistema',
              font=('Times New Roman', 10)).pack()
     
-    # Frame para lista de usuários
-    lista_frame = tk.Frame(main_frame)
+    lista_frame = tk.Frame(scrollable_frame, padx=20)
     lista_frame.pack(fill='both', expand=True, pady=(0, 20))
     
     tk.Label(lista_frame, text='Usuários Cadastrados:', 
              font=('Times New Roman', 12, 'bold')).pack(anchor='w')
     
-    # Lista com scrollbar
     lista_container = tk.Frame(lista_frame)
     lista_container.pack(fill='both', expand=True, pady=5)
     
     lista_usuarios = tk.Listbox(lista_container, font=('Times New Roman', 11), height=8)
-    scrollbar = tk.Scrollbar(lista_container)
-    lista_usuarios.configure(yscrollcommand=scrollbar.set)
-    scrollbar.config(command=lista_usuarios.yview)
+    scrollbar_lista = tk.Scrollbar(lista_container)
+    lista_usuarios.configure(yscrollcommand=scrollbar_lista.set)
+    scrollbar_lista.config(command=lista_usuarios.yview)
     
     lista_usuarios.pack(side='left', fill='both', expand=True)
-    scrollbar.pack(side='right', fill='y')
+    scrollbar_lista.pack(side='right', fill='y')
     
-    # Atualizar lista
     def atualizar_lista():
         lista_usuarios.delete(0, tk.END)
         usuarios_carregados = carregar_usuarios()
@@ -485,14 +1409,12 @@ def usuarios():
     
     atualizar_lista()
     
-    # Frame para formulário
-    form_frame = tk.Frame(main_frame)
+    form_frame = tk.Frame(scrollable_frame, padx=20)
     form_frame.pack(fill='x', pady=(0, 20))
     
     tk.Label(form_frame, text='Novo Usuário:', 
              font=('Times New Roman', 12, 'bold')).pack(anchor='w', pady=(0, 10))
     
-    # Campos do formulário
     campos = [
         ("Nome Completo*:", "entry_nome"),
         ("Data Nascimento:", "entry_nasc"),
@@ -507,12 +1429,11 @@ def usuarios():
         frame_campo = tk.Frame(form_frame)
         frame_campo.pack(fill='x', pady=3)
         
-        tk.Label(frame_campo, text=label_text, width=20, anchor='w', font=('Times New Roman', 10)).pack(side='left')
-        entry = tk.Entry(frame_campo, font=('Times New Roman', 10), width=40)
+        tk.Label(frame_campo, text=label_text, width=18, anchor='w', font=('Times New Roman', 10)).pack(side='left')
+        entry = tk.Entry(frame_campo, font=('Times New Roman', 10), width=30)
         entry.pack(side='left', padx=5, fill='x', expand=True)
         entries[var_name] = entry
     
-    # Funções
     def adicionar_usuario():
         nome = entries['entry_nome'].get().strip()
         matricula = entries['entry_matricula'].get().strip()
@@ -542,7 +1463,6 @@ def usuarios():
         salvar_usuarios(usuarios_atual)
         atualizar_lista()
         
-        # Limpar campos
         for entry in entries.values():
             entry.delete(0, tk.END)
         
@@ -578,7 +1498,6 @@ def usuarios():
         if nome in usuarios_atual:
             info = usuarios_atual[nome]
             
-            # Preencher campos com dados do usuário
             entries['entry_nome'].delete(0, tk.END)
             entries['entry_nome'].insert(0, nome)
             entries['entry_nasc'].delete(0, tk.END)
@@ -594,8 +1513,7 @@ def usuarios():
             
             messagebox.showinfo("Editar", f"Preencha os campos para editar {nome}")
     
-    # Frame para botões de ação
-    acoes_frame = tk.Frame(main_frame)
+    acoes_frame = tk.Frame(scrollable_frame, padx=20)
     acoes_frame.pack(fill='x', pady=(0, 20))
     
     tk.Button(acoes_frame, text="Adicionar", font=('Times New Roman', 10),
@@ -614,87 +1532,93 @@ def usuarios():
               command=atualizar_lista, bg='#2196F3', fg='white',
               padx=15, pady=5).pack(side='left', padx=5)
     
-    # Botão Voltar
     def voltar_usuarios():
         usuario.destroy()
         app.deiconify()
     
-    tk.Button(main_frame, text="Voltar ao Menu Principal", font=('Times New Roman', 10),
+    tk.Button(scrollable_frame, text="Voltar ao Menu Principal", font=('Times New Roman', 10),
               command=voltar_usuarios, bg='#757575', fg='white',
-              padx=20, pady=8).pack(pady=10)
+              padx=20, pady=8).pack(pady=20)
     
     usuario.protocol("WM_DELETE_WINDOW", voltar_usuarios)
+    usuario.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
 
+# ========== INTERFACE DE GERENCIAMENTO DE CARTÕES RFID ==========
 def gerenciar():
     app.withdraw()
     gerencia = tk.Toplevel()
     gerencia.title('SIIE - Gerenciamento de Cartões RFID')
-    gerencia.geometry('550x700')
-    gerencia.resizable(False, True)
+    gerencia.geometry('500x700')
+    gerencia.resizable(False, False)
     
-    # Frame principal com scrollbar
-    main_canvas = tk.Canvas(gerencia)
-    scrollbar = tk.Scrollbar(gerencia, orient="vertical", command=main_canvas.yview)
-    scrollable_frame = tk.Frame(main_canvas)
+    main_frame = tk.Frame(gerencia)
+    main_frame.pack(fill='both', expand=True)
+    
+    canvas = tk.Canvas(main_frame)
+    scrollbar = tk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+    scrollable_frame = tk.Frame(canvas)
     
     scrollable_frame.bind(
         "<Configure>",
-        lambda e: main_canvas.configure(scrollregion=main_canvas.bbox("all"))
+        lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
     )
     
-    main_canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-    main_canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
     
-    main_canvas.pack(side="left", fill="both", expand=True)
+    canvas.pack(side="left", fill="both", expand=True)
     scrollbar.pack(side="right", fill="y")
     
-    # Título
-    titulo_frame = tk.Frame(scrollable_frame)
-    titulo_frame.pack(fill='x', padx=20, pady=(20, 10))
+    def _on_mousewheel(event):
+        canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+    
+    canvas.bind_all("<MouseWheel>", _on_mousewheel)
+    
+    titulo_frame = tk.Frame(scrollable_frame, padx=20)
+    titulo_frame.pack(fill='x', pady=(20, 10))
     
     tk.Label(titulo_frame, text='GERENCIAMENTO DE CARTÕES RFID', 
              font=('Times New Roman', 18, 'bold')).pack()
     tk.Label(titulo_frame, text='Associe cartões RFID aos usuários',
              font=('Times New Roman', 10)).pack()
     
-    # Carregar dados
+    serial_frame = tk.Frame(titulo_frame)
+    serial_frame.pack(pady=10)
+    
+    tk.Button(serial_frame, text="Configurar Conexão Arduino", 
+              font=('Times New Roman', 10, 'bold'),
+              command=configuracao_serial, bg='#607D8B', fg='white',
+              padx=15, pady=8).pack()
+    
     cartoes_atual = carregar_cartoes()
     usuarios_atual = carregar_usuarios()
     nomes_usuarios = list(usuarios_atual.keys())
     
-    # Variáveis para armazenar seleções
     cartao_vars = {}
     
-    # Frame para cartões
-    cartoes_frame = tk.Frame(scrollable_frame)
-    cartoes_frame.pack(fill='x', padx=20, pady=10)
+    cartoes_frame = tk.Frame(scrollable_frame, padx=20)
+    cartoes_frame.pack(fill='x', pady=10)
     
-    # Criar widgets para cada cartão
     for uid, info in cartoes_atual.items():
-        # Frame para cada cartão
         frame_cartao = tk.Frame(cartoes_frame, relief='groove', borderwidth=2, 
                                bg='#f8f9fa', padx=15, pady=10)
         frame_cartao.pack(fill='x', pady=8, padx=5)
         
-        # UID do cartão
         uid_frame = tk.Frame(frame_cartao, bg='#f8f9fa')
         uid_frame.pack(fill='x', pady=(0, 10))
         
         tk.Label(uid_frame, text=f"Cartão UID: {uid}", 
                 font=('Times New Roman', 11, 'bold'), bg='#f8f9fa').pack(side='left')
         
-        # Status do cartão
         var_ativo = tk.BooleanVar(value=info.get('ativo', True))
         check_ativo = tk.Checkbutton(uid_frame, text="Ativo", 
                                     variable=var_ativo,
                                     font=('Times New Roman', 9), bg='#f8f9fa')
         check_ativo.pack(side='right')
         
-        # Dono do cartão
         tk.Label(frame_cartao, text="Usuário Associado:", 
                 font=('Times New Roman', 10), bg='#f8f9fa').pack(anchor='w')
         
-        # ComboBox para selecionar usuário
         combo_dono = ttk.Combobox(frame_cartao, 
                                  values=nomes_usuarios,
                                  font=('Times New Roman', 10),
@@ -702,7 +1626,6 @@ def gerenciar():
         combo_dono.set(info.get('dono', ''))
         combo_dono.pack(fill='x', pady=5)
         
-        # Status atual
         dono_atual = info.get('dono', '')
         if dono_atual:
             status_text = f"Associado a: {dono_atual}"
@@ -712,14 +1635,11 @@ def gerenciar():
         tk.Label(frame_cartao, text=status_text, 
                 font=('Times New Roman', 9), bg='#f8f9fa', fg='#666').pack(anchor='w')
         
-        # Armazenar referências
-        cartao_vars[uid] = {'ativo': var_ativo, 'dono_combo': combo_dono}
+        cartao_vars[uid] = {'ativo': var_ativo, 'dono_combo': combo_dono, 'uid': uid}
     
-    # Frame para botões de gerenciamento
-    botoes_frame = tk.Frame(scrollable_frame)
-    botoes_frame.pack(fill='x', padx=20, pady=20)
+    botoes_frame = tk.Frame(scrollable_frame, padx=20)
+    botoes_frame.pack(fill='x', pady=20)
     
-    # Função para salvar alterações
     def salvar_alteracoes():
         for uid, vars in cartao_vars.items():
             cartoes_atual[uid]['ativo'] = vars['ativo'].get()
@@ -728,24 +1648,99 @@ def gerenciar():
         salvar_cartoes(cartoes_atual)
         messagebox.showinfo("Sucesso", "Alterações salvas com sucesso!")
     
-    # Botão para salvar
     tk.Button(botoes_frame, text="Salvar Todas as Alterações", 
               font=('Times New Roman', 11, 'bold'),
               command=salvar_alteracoes, bg='#4CAF50', fg='white',
               padx=20, pady=10).pack(fill='x')
     
-    # Frame para adicionar novo cartão
-    adicionar_frame = tk.Frame(scrollable_frame)
-    adicionar_frame.pack(fill='x', padx=20, pady=20)
+    # Função para editar UID de cartão
+    def editar_uid_cartao_interface():
+        selecao = None
+        uid_antigo = None
+        
+        # Procura qual cartão está selecionado
+        for uid, vars in cartao_vars.items():
+            # Verifica se algum widget do cartão tem foco
+            if vars['dono_combo'].focus_get() or any(str(vars['ativo']) in str(widget.focus_get()) for widget in [vars['ativo']._root]):
+                selecao = uid
+                break
+        
+        if not selecao:
+            messagebox.showwarning("Aviso", "Selecione um cartão para editar o UID!")
+            return
+        
+        uid_antigo = selecao
+        
+        # Janela para editar UID
+        janela_editar = tk.Toplevel(gerencia)
+        janela_editar.title("Editar UID do Cartão")
+        janela_editar.geometry("400x300")
+        janela_editar.resizable(False, False)
+        
+        main_frame_editar = tk.Frame(janela_editar, padx=20, pady=20)
+        main_frame_editar.pack(fill='both', expand=True)
+        
+        tk.Label(main_frame_editar, text="EDITAR UID DO CARTÃO", 
+                font=('Times New Roman', 16, 'bold')).pack(pady=(0, 20))
+        
+        tk.Label(main_frame_editar, text=f"UID Atual:", 
+                font=('Times New Roman', 11)).pack(anchor='w')
+        tk.Label(main_frame_editar, text=f"{uid_antigo}", 
+                font=('Courier New', 11, 'bold'), fg='#2c3e50').pack(anchor='w', pady=(0, 20))
+        
+        tk.Label(main_frame_editar, text="Novo UID*:", 
+                font=('Times New Roman', 11)).pack(anchor='w')
+        entry_novo_uid = tk.Entry(main_frame_editar, font=('Times New Roman', 11))
+        entry_novo_uid.pack(fill='x', pady=(0, 20))
+        entry_novo_uid.focus_set()
+        
+        info_label = tk.Label(main_frame_editar, text="Formato: A7 D6 DE D7 (letras A-F, números 0-9, espaços)",
+                             font=('Times New Roman', 9), fg='#666')
+        info_label.pack(anchor='w', pady=(0, 20))
+        
+        def confirmar_edicao():
+            uid_novo = entry_novo_uid.get().strip().upper()
+            
+            if not uid_novo:
+                messagebox.showerror("Erro", "Digite o novo UID!")
+                return
+            
+            sucesso, mensagem = editar_uid_cartao(uid_antigo, uid_novo)
+            
+            if sucesso:
+                messagebox.showinfo("Sucesso", mensagem)
+                janela_editar.destroy()
+                gerencia.destroy()
+                gerenciar()  # Recarrega a janela
+            else:
+                messagebox.showerror("Erro", mensagem)
+        
+        botoes_frame_editar = tk.Frame(main_frame_editar)
+        botoes_frame_editar.pack(fill='x', pady=10)
+        
+        tk.Button(botoes_frame_editar, text="Confirmar Edição", 
+                 command=confirmar_edicao, bg='#4CAF50', fg='white',
+                 padx=15, pady=8, font=('Times New Roman', 10)).pack(side='left', padx=5)
+        
+        tk.Button(botoes_frame_editar, text="Cancelar", 
+                 command=janela_editar.destroy, bg='#F44336', fg='white',
+                 padx=15, pady=8, font=('Times New Roman', 10)).pack(side='right', padx=5)
+    
+    # Botão para editar UID
+    tk.Button(botoes_frame, text="Editar UID do Cartão", 
+              font=('Times New Roman', 11, 'bold'),
+              command=editar_uid_cartao_interface, bg='#9C27B0', fg='white',
+              padx=20, pady=10).pack(fill='x', pady=(10, 0))
+    
+    adicionar_frame = tk.Frame(scrollable_frame, padx=20)
+    adicionar_frame.pack(fill='x', pady=20)
     
     tk.Label(adicionar_frame, text='ADICIONAR NOVO CARTÃO', 
              font=('Times New Roman', 14, 'bold')).pack(anchor='w', pady=(0, 10))
     
-    # Formulário para novo cartão
     form_novo_frame = tk.Frame(adicionar_frame)
     form_novo_frame.pack(fill='x')
     
-    # Campo UID
     uid_frame = tk.Frame(form_novo_frame)
     uid_frame.pack(fill='x', pady=5)
     tk.Label(uid_frame, text="UID do Cartão*:", 
@@ -753,7 +1748,6 @@ def gerenciar():
     entry_uid = tk.Entry(uid_frame, font=('Times New Roman', 10))
     entry_uid.pack(side='left', fill='x', expand=True, padx=5)
     
-    # Campo Usuário
     user_frame = tk.Frame(form_novo_frame)
     user_frame.pack(fill='x', pady=5)
     tk.Label(user_frame, text="Usuário:", 
@@ -762,13 +1756,11 @@ def gerenciar():
                                   font=('Times New Roman', 10))
     combo_novo_user.pack(side='left', fill='x', expand=True, padx=5)
     
-    # Checkbox Ativo
     ativo_var = tk.BooleanVar(value=True)
     check_novo_ativo = tk.Checkbutton(form_novo_frame, text="Cartão Ativo",
                                      variable=ativo_var, font=('Times New Roman', 10))
     check_novo_ativo.pack(anchor='w', pady=5)
     
-    # Botão para adicionar
     def adicionar_novo_cartao():
         uid = entry_uid.get().strip()
         dono = combo_novo_user.get()
@@ -778,11 +1770,9 @@ def gerenciar():
         
         if sucesso:
             messagebox.showinfo("Sucesso", mensagem)
-            # Limpar campos
             entry_uid.delete(0, tk.END)
             combo_novo_user.set('')
             ativo_var.set(True)
-            # Recarregar interface
             gerencia.destroy()
             gerenciar()
         else:
@@ -793,12 +1783,10 @@ def gerenciar():
               command=adicionar_novo_cartao, bg='#2196F3', fg='white',
               padx=15, pady=8).pack(pady=10)
     
-    # Separador
     tk.Frame(scrollable_frame, height=2, bg='#ddd').pack(fill='x', padx=20, pady=10)
     
-    # Seção para registro manual de ponto
-    registro_frame = tk.Frame(scrollable_frame)
-    registro_frame.pack(fill='x', padx=20, pady=10)
+    registro_frame = tk.Frame(scrollable_frame, padx=20)
+    registro_frame.pack(fill='x', pady=10)
     
     tk.Label(registro_frame, text='REGISTRO MANUAL DE PONTO', 
              font=('Times New Roman', 14, 'bold')).pack(anchor='w', pady=(0, 10))
@@ -812,17 +1800,14 @@ def gerenciar():
         janela_registro.geometry("400x500")
         janela_registro.resizable(False, False)
         
-        # Frame principal
         main_frame_reg = tk.Frame(janela_registro, padx=20, pady=20)
         main_frame_reg.pack(fill='both', expand=True)
         
         tk.Label(main_frame_reg, text="Registro Manual", 
                 font=('Times New Roman', 16, 'bold')).pack(pady=(0, 20))
         
-        # Campos
         campos_reg = []
         
-        # Usuário
         tk.Label(main_frame_reg, text="Usuário*:", 
                 font=('Times New Roman', 10)).pack(anchor='w')
         combo_user = ttk.Combobox(main_frame_reg, values=nomes_usuarios, 
@@ -830,7 +1815,6 @@ def gerenciar():
         combo_user.pack(fill='x', pady=(0, 15))
         campos_reg.append(combo_user)
         
-        # Data
         tk.Label(main_frame_reg, text="Data (DD/MM/AAAA)*:", 
                 font=('Times New Roman', 10)).pack(anchor='w')
         entry_data = tk.Entry(main_frame_reg, font=('Times New Roman', 10))
@@ -838,7 +1822,6 @@ def gerenciar():
         entry_data.pack(fill='x', pady=(0, 15))
         campos_reg.append(entry_data)
         
-        # Hora Entrada
         tk.Label(main_frame_reg, text="Hora Entrada (HH:MM)*:", 
                 font=('Times New Roman', 10)).pack(anchor='w')
         entry_entrada = tk.Entry(main_frame_reg, font=('Times New Roman', 10))
@@ -846,7 +1829,6 @@ def gerenciar():
         entry_entrada.pack(fill='x', pady=(0, 15))
         campos_reg.append(entry_entrada)
         
-        # Hora Saída
         tk.Label(main_frame_reg, text="Hora Saída (HH:MM)*:", 
                 font=('Times New Roman', 10)).pack(anchor='w')
         entry_saida = tk.Entry(main_frame_reg, font=('Times New Roman', 10))
@@ -854,7 +1836,6 @@ def gerenciar():
         entry_saida.pack(fill='x', pady=(0, 15))
         campos_reg.append(entry_saida)
         
-        # Cartão
         tk.Label(main_frame_reg, text="Cartão UID:", 
                 font=('Times New Roman', 10)).pack(anchor='w')
         combo_cartao = ttk.Combobox(main_frame_reg, 
@@ -874,10 +1855,8 @@ def gerenciar():
                     messagebox.showerror("Erro", "Preencha todos os campos obrigatórios!")
                     return
                 
-                # Carregar dados existentes
                 df = carregar_dados_xlsx()
                 
-                # Calcular horas
                 entrada_dt = datetime.strptime(f"{data_str} {entrada_str}", "%d/%m/%Y %H:%M")
                 saida_dt = datetime.strptime(f"{data_str} {saida_str}", "%d/%m/%Y %H:%M")
                 
@@ -887,7 +1866,6 @@ def gerenciar():
                 
                 horas = saida_dt - entrada_dt
                 
-                # Adicionar ao DataFrame
                 novo_registro = {
                     'Usuario': usuario,
                     'Data': data_str,
@@ -897,7 +1875,7 @@ def gerenciar():
                     'Cartao': cartao if cartao else "Manual"
                 }
                 
-                df = df._append(novo_registro, ignore_index=True)
+                df = pd.concat([df, pd.DataFrame([novo_registro])], ignore_index=True)
                 salvar_dados_xlsx(df)
                 
                 messagebox.showinfo("Sucesso", "Ponto registrado com sucesso!")
@@ -908,7 +1886,6 @@ def gerenciar():
             except Exception as e:
                 messagebox.showerror("Erro", f"Erro: {str(e)}")
         
-        # Botões
         botoes_frame_reg = tk.Frame(main_frame_reg)
         botoes_frame_reg.pack(fill='x', pady=10)
         
@@ -923,48 +1900,67 @@ def gerenciar():
                  command=fechar_registro, bg='#F44336', fg='white',
                  padx=15, pady=8, font=('Times New Roman', 10)).pack(side='right')
     
-    # Botão para registro manual
-    tk.Button(registro_frame, text="Registrar Ponto Manual", 
+    tk.Button(registro_frame, text="📝 Registrar Ponto Manual", 
               font=('Times New Roman', 10),
               command=abrir_registro_manual, bg='#2196F3', fg='white',
               padx=15, pady=8).pack()
     
-    # Botão Voltar
     def voltar_gerencia():
         gerencia.destroy()
         app.deiconify()
     
     tk.Button(scrollable_frame, text="Voltar ao Menu Principal", 
-              font=('Times New Roman', 10),
+              font=('Times New Roman', 10, 'bold'),
               command=voltar_gerencia, bg='#757575', fg='white',
               padx=20, pady=10).pack(pady=20)
     
     gerencia.protocol("WM_DELETE_WINDOW", voltar_gerencia)
+    gerencia.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
 
+# ========== SIMULADOR RFID ==========
 def simulador_rfid():
     """Função para simular leitura de cartões RFID"""
     app.withdraw()
     simulador = tk.Toplevel()
     simulador.title('SIIE - Simulador RFID')
-    simulador.geometry('500x450')
+    simulador.geometry('500x700')
     simulador.resizable(False, False)
     
-    # Frame principal
-    main_frame = tk.Frame(simulador, padx=20, pady=20)
+    main_frame = tk.Frame(simulador)
     main_frame.pack(fill='both', expand=True)
     
-    # Título
-    tk.Label(main_frame, text='SIMULADOR RFID', 
+    canvas = tk.Canvas(main_frame)
+    scrollbar = tk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+    scrollable_frame = tk.Frame(canvas)
+    
+    scrollable_frame.bind(
+        "<Configure>",
+        lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+    )
+    
+    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+    
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+    
+    def _on_mousewheel(event):
+        canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+    
+    canvas.bind_all("<MouseWheel>", _on_mousewheel)
+    
+    content_frame = tk.Frame(scrollable_frame, padx=20, pady=20)
+    content_frame.pack(fill='both', expand=True)
+    
+    tk.Label(content_frame, text='SIMULADOR RFID', 
              font=('Times New Roman', 18, 'bold')).pack(pady=(0, 10))
     
-    tk.Label(main_frame, text='Simule a leitura de cartões RFID para testes',
+    tk.Label(content_frame, text='Simule a leitura de cartões RFID para testes',
              font=('Times New Roman', 10)).pack(pady=(0, 20))
     
-    # Carregar dados
     cartoes_atual = carregar_cartoes()
     
-    # Frame para seleção de cartão
-    selecao_frame = tk.Frame(main_frame)
+    selecao_frame = tk.Frame(content_frame)
     selecao_frame.pack(fill='x', pady=10)
     
     tk.Label(selecao_frame, text="Selecione o cartão:", 
@@ -975,8 +1971,7 @@ def simulador_rfid():
                                  font=('Times New Roman', 11))
     combo_cartoes.pack(fill='x', pady=5)
     
-    # Frame para informações
-    info_frame = tk.Frame(main_frame, relief='groove', borderwidth=2, 
+    info_frame = tk.Frame(content_frame, relief='groove', borderwidth=2, 
                          bg='#f0f0f0', padx=15, pady=15)
     info_frame.pack(fill='x', pady=20)
     
@@ -987,8 +1982,7 @@ def simulador_rfid():
              font=('Times New Roman', 10), bg='#f0f0f0', 
              wraplength=400, justify='left').pack()
     
-    # Frame para resultado
-    resultado_frame = tk.Frame(main_frame, bg='#e8f5e9', 
+    resultado_frame = tk.Frame(content_frame, bg='#e8f5e9', 
                               relief='solid', borderwidth=1)
     resultado_frame.pack(fill='x', pady=10)
     
@@ -999,7 +1993,20 @@ def simulador_rfid():
              font=('Times New Roman', 11, 'bold'), bg='#e8f5e9',
              padx=10, pady=10).pack()
     
-    # Função para atualizar informações
+    historico_frame = tk.Frame(content_frame)
+    historico_frame.pack(fill='both', expand=True, pady=20)
+    
+    tk.Label(historico_frame, text='Histórico de Simulações:', 
+             font=('Times New Roman', 12, 'bold')).pack(anchor='w', pady=(0, 10))
+    
+    historico_text = tk.Text(historico_frame, height=8, font=('Courier New', 9), wrap=tk.WORD)
+    scrollbar_historico = tk.Scrollbar(historico_frame)
+    historico_text.configure(yscrollcommand=scrollbar_historico.set)
+    scrollbar_historico.config(command=historico_text.yview)
+    
+    historico_text.pack(side='left', fill='both', expand=True)
+    scrollbar_historico.pack(side='right', fill='y')
+    
     def atualizar_info():
         uid = combo_cartoes.get()
         if not uid:
@@ -1017,7 +2024,6 @@ def simulador_rfid():
     
     combo_cartoes.bind('<<ComboboxSelected>>', lambda e: atualizar_info())
     
-    # Função para registrar leitura
     def registrar_leitura():
         uid = combo_cartoes.get()
         if not uid:
@@ -1038,21 +2044,18 @@ def simulador_rfid():
             resultado_text.set("Cartão sem dono associado!")
             return
         
-        # Registrar ponto
         agora = datetime.now()
         data_str = agora.strftime("%d/%m/%Y")
         hora_str = agora.strftime("%H:%M")
         
         df = carregar_dados_xlsx()
         
-        # Filtrar registros
         registros_hoje = df[
             (df['Usuario'] == dono) & 
             (df['Data'] == data_str)
         ]
         
         if registros_hoje.empty or registros_hoje['Saida'].notna().all():
-            # Entrada
             novo_registro = {
                 'Usuario': dono,
                 'Data': data_str,
@@ -1061,10 +2064,11 @@ def simulador_rfid():
                 'Horas': '',
                 'Cartao': uid
             }
-            df = df._append(novo_registro, ignore_index=True)
-            resultado_text.set(f"ENTRADA registrada\n{dono}\n{hora_str}")
+            df = pd.concat([df, pd.DataFrame([novo_registro])], ignore_index=True)
+            resultado = f"ENTRADA registrada\n{dono}\n{hora_str}"
+            resultado_text.set(resultado)
+            historico_text.insert(tk.END, f"[{hora_str}] ENTRADA: {dono} ({uid})\n")
         else:
-            # Saída
             idx = registros_hoje.index[-1]
             entrada_str = df.at[idx, 'Entrada']
             df.at[idx, 'Saida'] = hora_str
@@ -1077,16 +2081,20 @@ def simulador_rfid():
                 
                 horas_total = horas.seconds // 3600
                 minutos_total = (horas.seconds % 3600) // 60
-                resultado_text.set(f"SAÍDA registrada\n{dono}\n{hora_str}\nTotal: {horas_total}h{minutos_total:02d}min")
+                resultado = f"SAÍDA registrada\n{dono}\n{hora_str}\nTotal: {horas_total}h{minutos_total:02d}min"
+                resultado_text.set(resultado)
+                historico_text.insert(tk.END, f"[{hora_str}] SAÍDA: {dono} - Total: {horas_total}h{minutos_total:02d}min\n")
             except:
                 df.at[idx, 'Horas'] = 'Erro no cálculo'
-                resultado_text.set(f"SAÍDA registrada\n{dono}\n{hora_str}")
+                resultado = f"SAÍDA registrada\n{dono}\n{hora_str}"
+                resultado_text.set(resultado)
+                historico_text.insert(tk.END, f"[{hora_str}] SAÍDA: {dono} (Erro no cálculo)\n")
         
         salvar_dados_xlsx(df)
         atualizar_info()
+        historico_text.see(tk.END)
     
-    # Frame para botões
-    botoes_frame = tk.Frame(main_frame)
+    botoes_frame = tk.Frame(content_frame)
     botoes_frame.pack(fill='x', pady=20)
     
     tk.Button(botoes_frame, text="Simular Leitura RFID", 
@@ -1094,43 +2102,41 @@ def simulador_rfid():
               command=registrar_leitura, bg='#9C27B0', fg='white',
               padx=20, pady=10).pack(fill='x')
     
-    # Botão Voltar
+    def limpar_historico():
+        historico_text.delete(1.0, tk.END)
+    
+    tk.Button(botoes_frame, text="Limpar Histórico", 
+              font=('Times New Roman', 10),
+              command=limpar_historico, bg='#757575', fg='white',
+              padx=15, pady=8).pack(pady=10)
+    
     def voltar_simulador():
         simulador.destroy()
         app.deiconify()
     
-    tk.Button(main_frame, text="Voltar ao Menu Principal", 
+    tk.Button(content_frame, text="Voltar ao Menu Principal", 
               font=('Times New Roman', 10),
               command=voltar_simulador, bg='#757575', fg='white',
-              padx=15, pady=8).pack()
+              padx=15, pady=8).pack(pady=10)
     
     simulador.protocol("WM_DELETE_WINDOW", voltar_simulador)
+    simulador.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
 
+# ========== SAIR DO APLICATIVO ==========
 def sair_aplicativo():
     """Função para sair do aplicativo"""
     if messagebox.askyesno("Sair", "Deseja realmente sair do SIIE?"):
+        parar_conexao_automatica()
+        desconectar_arduino()
         app.quit()
 
 # ========== INTERFACE PRINCIPAL ==========
+# Configuração de cores para a interface principal
+app.configure(bg='#2c3e50')
 
-# Configurar estilo da janela principal
-try:
-    # Tentar carregar imagem de fundo
-    ar1 = Image.open(r"D:\Projetos\Alpha\SIIE\WhatsApp Image 2025-12-07 at 16.04.48.jpeg")
-    ar1 = ar1.resize((500, 700), Image.Resampling.LANCZOS)
-    background_image = ImageTk.PhotoImage(ar1)
-    background_label = tk.Label(app, image=background_image)
-    background_label.place(x=0, y=0, relwidth=1, relheight=1)
-except Exception as e:
-    print(f"Erro ao carregar imagem de fundo: {e}")
-    # Se não conseguir, usar cor de fundo
-    app.configure(bg='#2c3e50')
-
-# Frame principal para conteúdo
 main_content = tk.Frame(app, bg='white')
 main_content.place(relx=0.5, rely=0.5, anchor='center', width=450, height=600)
 
-# Cabeçalho
 header_frame = tk.Frame(main_content, bg='#3498db', height=100)
 header_frame.pack(fill='x')
 header_frame.pack_propagate(False)
@@ -1141,15 +2147,14 @@ tk.Label(header_frame, text='SIIE', font=('Times New Roman', 32, 'bold'),
 tk.Label(header_frame, text='Sistema Interno de Informações de Estagio', 
          font=('Times New Roman', 10), bg='#3498db', fg='white').pack(pady=(0, 10))
 
-# Frame para botões principais
 buttons_frame = tk.Frame(main_content, bg='white', padx=30, pady=30)
 buttons_frame.pack(fill='both', expand=True)
 
-# Botões principais com ícones
 botoes_menu = [
     ("Dados e Relatórios", dadoss, "#2ecc71"),
     ("Gerenciar Usuários", usuarios, "#e74c3c"),
     ("Gerenciar Cartões RFID", gerenciar, "#f39c12"),
+    ("Configurar Conexão Arduino", configuracao_serial, "#607D8B"),
     ("Simulador RFID", simulador_rfid, "#9b59b6"),
     ("Sair do Sistema", sair_aplicativo, "#7f8c8d")
 ]
@@ -1160,11 +2165,9 @@ for texto, comando, cor in botoes_menu:
                     padx=20, pady=12, width=25,
                     cursor='hand2')
     btn.pack(pady=8)
-    # Efeito hover simples
     btn.bind("<Enter>", lambda e, b=btn: b.config(bg='#34495e'))
     btn.bind("<Leave>", lambda e, b=btn, c=cor: b.config(bg=c))
 
-# Status do sistema
 status_frame = tk.Frame(main_content, bg='#ecf0f1', height=80)
 status_frame.pack(fill='x', side='bottom')
 status_frame.pack_propagate(False)
@@ -1172,29 +2175,38 @@ status_frame.pack_propagate(False)
 status_inner = tk.Frame(status_frame, bg='#ecf0f1', padx=20, pady=10)
 status_inner.pack(expand=True)
 
-# Carregar dados para status
 usuarios_status = carregar_usuarios()
 cartoes_status = carregar_cartoes()
 dados_status = carregar_dados_xlsx()
 
-tk.Label(status_inner, text=f"{len(usuarios_status)} usuários | ", 
+tk.Label(status_inner, text=f" {len(usuarios_status)} usuários | ", 
          font=('Times New Roman', 9), bg='#ecf0f1').pack(side='left')
-tk.Label(status_inner, text=f"{len(cartoes_status)} cartões | ", 
+tk.Label(status_inner, text=f" {len(cartoes_status)} cartões | ", 
          font=('Times New Roman', 9), bg='#ecf0f1').pack(side='left')
-tk.Label(status_inner, text=f"{len(dados_status)} registros", 
+tk.Label(status_inner, text=f" {len(dados_status)} registros", 
          font=('Times New Roman', 9), bg='#ecf0f1').pack(side='left')
 
-# Rodapé
+notif_frame = tk.Frame(status_frame, bg='#ecf0f1')
+notif_frame.pack(fill='x', padx=20, pady=(5, 0))
+
+notif_label = tk.Label(notif_frame, textvariable=notif_var, 
+                      font=('Times New Roman', 9), bg='#ecf0f1', fg='gray',
+                      wraplength=410, justify='center')
+notif_label.pack()
+app.notif_label = notif_label
+
 footer_frame = tk.Frame(app, bg='#2c3e50', height=30)
 footer_frame.pack(side='bottom', fill='x')
 footer_frame.pack_propagate(False)
 
-tk.Label(footer_frame, text='SIIE v2.0 © 2025 - Sistema Interno de Informações de Estagio', 
+tk.Label(footer_frame, text='SIIE v3.0 © 2025 - Sistema Interno de Informações de Estagio', 
          font=('Times New Roman', 8), bg='#2c3e50', fg='#bdc3c7').pack(expand=True)
 
-# Centralizar janela na tela
 app.eval('tk::PlaceWindow . center')
 
-# Iniciar aplicação
 print("SIIE iniciando...")
+log_event("Sistema SIIE iniciado")
+
+app.after(2000, lambda: iniciar_conexao_automatica())
+
 app.mainloop()
